@@ -133,7 +133,7 @@ impl<'a, H: 'a + Hasher> ProofScheme<'a> for MerklePoR<H> {
                 return Ok(false);
             }
         }
-        let data_valid = proof.proof.validate_data(proof.data);
+        let data_valid = proof.proof.validate_data(&proof.data.into_bytes());
         let path_valid = proof.proof.validate(pub_inputs.challenge);
 
         Ok(data_valid && path_valid)
@@ -168,7 +168,7 @@ mod tests {
             .collect();
 
         let graph = BucketGraph::<H>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
-        let tree = graph.merkle_tree(None, data.as_slice()).unwrap();
+        let tree = graph.merkle_tree(data.as_slice()).unwrap();
 
         let pub_inputs = PublicInputs {
             challenge: 3,
@@ -240,7 +240,7 @@ mod tests {
             .collect();
 
         let graph = BucketGraph::<H>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
-        let tree = graph.merkle_tree(None, data.as_slice()).unwrap();
+        let tree = graph.merkle_tree(data.as_slice()).unwrap();
 
         let pub_inputs = PublicInputs {
             challenge: 3,
@@ -284,7 +284,7 @@ mod tests {
             .collect();
 
         let graph = BucketGraph::<H>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
-        let tree = graph.merkle_tree(None, data.as_slice()).unwrap();
+        let tree = graph.merkle_tree(data.as_slice()).unwrap();
 
         let pub_inputs = PublicInputs {
             challenge: 3,

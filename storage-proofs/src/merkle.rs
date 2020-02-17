@@ -3,11 +3,10 @@
 use std::marker::PhantomData;
 
 use anyhow::ensure;
-use log::trace;
 use merkletree::hash::Algorithm;
 use merkletree::merkle;
 use merkletree::proof;
-use merkletree::store::{LevelCacheStore, StoreConfig};
+use merkletree::store::StoreConfig;
 use paired::bls12_381::Fr;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -22,7 +21,6 @@ pub use merkletree::store::Store;
 
 type DiskStore<E> = merkletree::store::DiskStore<E>;
 pub type MerkleTree<T, A> = merkle::MerkleTree<T, A, DiskStore<T>>;
-pub type LCMerkleTree<T, A> = merkle::MerkleTree<T, A, LevelCacheStore<T, std::fs::File>>;
 pub type MerkleStore<T> = DiskStore<T>;
 
 /// Representation of a merkle proof.
@@ -127,17 +125,17 @@ impl<H: Hasher> MerkleProof<H> {
     }
 
     /// Validates that the data hashes to the leaf of the merkle path.
-    pub fn validate_data(&self, data: H::Domain) -> bool {
+    pub fn validate_data(&self, data: &[u8]) -> bool {
         if !self.verify() {
             return false;
         }
 
-        self.leaf() == data
+        self.leaf().into_bytes() == data
     }
 
     /// Returns the hash of leaf that this MerkleProof represents.
-    pub fn leaf(&self) -> H::Domain {
-        self.leaf
+    pub fn leaf(&self) -> &H::Domain {
+        &self.leaf
     }
 
     /// Returns the root hash
@@ -146,7 +144,7 @@ impl<H: Hasher> MerkleProof<H> {
     }
 
     pub fn verified_leaf(&self) -> IncludedNode<H> {
-        IncludedNode::new(self.leaf())
+        IncludedNode::new(*self.leaf())
     }
 
     /// Returns the length of the proof. That is all path elements plus 1 for the
@@ -164,7 +162,7 @@ impl<H: Hasher> MerkleProof<H> {
             out.extend(Domain::serialize(hash));
             out.push(*is_right as u8);
         }
-        out.extend(Domain::serialize(&self.leaf()));
+        out.extend(Domain::serialize(self.leaf()));
         out.extend(Domain::serialize(self.root()));
 
         out
@@ -231,7 +229,6 @@ pub fn create_merkle_tree<H: Hasher>(
         data.len() == (NODE_SIZE * size) as usize,
         Error::InvalidMerkleTreeArgs(data.len(), NODE_SIZE, size)
     );
-    trace!("create_merkle_tree called with size {}", size);
 
     let f = |i| {
         // TODO Replace `expect()` with `context()` (problem is the parallel iterator)
@@ -250,35 +247,6 @@ pub fn create_merkle_tree<H: Hasher>(
     }
 }
 
-/// Construct a new level cache merkle tree.
-pub fn create_lcmerkle_tree<H: Hasher>(
-    config: Option<StoreConfig>,
-    size: usize,
-    data: &[u8],
-) -> Result<LCMerkleTree<H::Domain, H::Function>> {
-    ensure!(
-        data.len() == (NODE_SIZE * size) as usize,
-        Error::InvalidMerkleTreeArgs(data.len(), NODE_SIZE, size)
-    );
-    trace!("create_lcmerkle_tree called with size {}", size);
-
-    let f = |i| {
-        // TODO Replace `expect()` with `context()` (problem is the parallel iterator)
-        let d = data_at_node(&data, i).expect("data_at_node math failed");
-        // TODO/FIXME: This can panic. FOR NOW, let's leave this since we're experimenting with
-        // optimization paths. However, we need to ensure that bad input will not lead to a panic
-        // that isn't caught by the FPS API.
-        // Unfortunately, it's not clear how to perform this error-handling in the parallel
-        // iterator case.
-        H::Domain::try_from_bytes(d).expect("failed to convert node data to domain element")
-    };
-
-    match config {
-        Some(x) => LCMerkleTree::from_par_iter_with_config((0..size).into_par_iter().map(f), x),
-        None => LCMerkleTree::from_par_iter((0..size).into_par_iter().map(f)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,19 +258,18 @@ mod tests {
     use crate::hasher::{Blake2sHasher, PedersenHasher, Sha256Hasher};
 
     fn merklepath<H: Hasher>() {
-        let leafs = 16;
-        let g = BucketGraph::<H>::new(leafs, BASE_DEGREE, 0, new_seed()).unwrap();
+        let g = BucketGraph::<H>::new(10, BASE_DEGREE, 0, new_seed()).unwrap();
         let mut rng = rand::thread_rng();
         let node_size = 32;
         let mut data = Vec::new();
-        for _ in 0..leafs {
+        for _ in 0..10 {
             let elt: H::Domain = H::Domain::random(&mut rng);
             let bytes = H::Domain::into_bytes(&elt);
             data.write(&bytes).unwrap();
         }
 
-        let tree = g.merkle_tree(None, data.as_slice()).unwrap();
-        for i in 0..leafs {
+        let tree = g.merkle_tree(data.as_slice()).unwrap();
+        for i in 0..10 {
             let proof = tree.gen_proof(i).unwrap();
 
             assert!(proof.validate::<H::Function>());
@@ -314,7 +281,7 @@ mod tests {
             assert!(mp.validate(i), "failed to validate valid merkle path");
             let data_slice = &data[i * node_size..(i + 1) * node_size].to_vec();
             assert!(
-                mp.validate_data(H::Domain::try_from_bytes(data_slice).unwrap()),
+                mp.validate_data(data_slice),
                 "failed to validate valid data"
             );
         }

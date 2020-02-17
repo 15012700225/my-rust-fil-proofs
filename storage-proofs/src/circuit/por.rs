@@ -12,7 +12,6 @@ use crate::compound_proof::{CircuitComponent, CompoundProof};
 use crate::crypto::pedersen::JJ_PARAMS;
 use crate::drgraph::graph_height;
 use crate::error::Result;
-use crate::hasher::types::PoseidonEngine;
 use crate::hasher::{HashFunction, Hasher};
 use crate::merklepor::MerklePoR;
 use crate::parameter_cache::{CacheableParameters, ParameterSetMetadata};
@@ -129,7 +128,7 @@ where
     }
 }
 
-impl<'a, E: JubjubEngine + PoseidonEngine, H: Hasher> Circuit<E> for PoRCircuit<'a, E, H> {
+impl<'a, E: JubjubEngine, H: Hasher> Circuit<E> for PoRCircuit<'a, E, H> {
     /// # Public Inputs
     ///
     /// This circuit expects the following public inputs.
@@ -183,11 +182,14 @@ impl<'a, E: JubjubEngine + PoseidonEngine, H: Hasher> Circuit<E> for PoRCircuit<
                     &cur_is_right,
                 )?;
 
+                let xl_bits = xl.to_bits_le(cs.namespace(|| "xl into bits"))?;
+                let xr_bits = xr.to_bits_le(cs.namespace(|| "xr into bits"))?;
+
                 // Compute the new subtree value
                 cur = H::Function::hash_leaf_circuit(
-                    cs.namespace(|| "computation of commitment hash"),
-                    &xl,
-                    &xr,
+                    cs.namespace(|| "computation of pedersen hash"),
+                    &xl_bits,
+                    &xr_bits,
                     i,
                     params,
                 )?;
@@ -213,7 +215,7 @@ impl<'a, E: JubjubEngine + PoseidonEngine, H: Hasher> Circuit<E> for PoRCircuit<
     }
 }
 
-impl<'a, E: JubjubEngine + PoseidonEngine, H: Hasher> PoRCircuit<'a, E, H> {
+impl<'a, E: JubjubEngine, H: Hasher> PoRCircuit<'a, E, H> {
     pub fn synthesize<CS>(
         mut cs: CS,
         params: &E::Params,
@@ -254,7 +256,7 @@ mod tests {
     use crate::crypto::pedersen::JJ_PARAMS;
     use crate::drgraph::{new_seed, BucketGraph, Graph, BASE_DEGREE};
     use crate::fr32::{bytes_into_fr, fr_into_bytes};
-    use crate::hasher::{Blake2sHasher, Domain, Hasher, PedersenHasher, PoseidonHasher};
+    use crate::hasher::{Blake2sHasher, Domain, Hasher, PedersenHasher};
     use crate::merklepor;
     use crate::proof::ProofScheme;
     use crate::util::data_at_node;
@@ -263,12 +265,12 @@ mod tests {
     #[ignore] // Slow test – run only when compiled for release.
     fn por_test_compound() {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
-        let leaves = 8;
+        let leaves = 6;
         let data: Vec<u8> = (0..leaves)
             .flat_map(|_| fr_into_bytes::<Bls12>(&Fr::random(rng)))
             .collect();
         let graph = BucketGraph::<PedersenHasher>::new(leaves, BASE_DEGREE, 0, new_seed()).unwrap();
-        let tree = graph.merkle_tree(None, data.as_slice()).unwrap();
+        let tree = graph.merkle_tree(data.as_slice()).unwrap();
 
         for i in 0..3 {
             let public_inputs = merklepor::PublicInputs {
@@ -282,7 +284,6 @@ mod tests {
                     private: false,
                 },
                 partitions: None,
-                priority: false,
             };
             let public_params =
                 PoRCompound::<PedersenHasher>::setup(&setup_params).expect("setup failed");
@@ -296,9 +297,11 @@ mod tests {
                 &tree,
             );
 
-            let gparams =
-                PoRCompound::<PedersenHasher>::groth_params(&public_params.vanilla_params)
-                    .expect("failed to generate groth params");
+            let gparams = PoRCompound::<PedersenHasher>::groth_params(
+                Some(rng),
+                &public_params.vanilla_params,
+            )
+            .expect("failed to generate groth params");
 
             let proof = PoRCompound::<PedersenHasher>::prove(
                 &public_params,
@@ -339,20 +342,15 @@ mod tests {
 
     #[test]
     fn test_por_input_circuit_with_bls12_381_blake2s() {
-        test_por_input_circuit_with_bls12_381::<Blake2sHasher>(64_569);
-    }
-
-    #[test]
-    fn test_por_input_circuit_with_bls12_381_poseidon() {
-        test_por_input_circuit_with_bls12_381::<PoseidonHasher>(1290);
+        test_por_input_circuit_with_bls12_381::<Blake2sHasher>(64566);
     }
 
     fn test_por_input_circuit_with_bls12_381<H: Hasher>(num_constraints: usize) {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
-        let leaves = 8;
+        let leaves = 6;
 
-        for i in 0..leaves {
+        for i in 0..6 {
             // -- Basic Setup
 
             let data: Vec<u8> = (0..leaves)
@@ -360,7 +358,7 @@ mod tests {
                 .collect();
 
             let graph = BucketGraph::<H>::new(leaves, BASE_DEGREE, 0, new_seed()).unwrap();
-            let tree = graph.merkle_tree(None, data.as_slice()).unwrap();
+            let tree = graph.merkle_tree(data.as_slice()).unwrap();
 
             // -- MerklePoR
 
@@ -451,18 +449,18 @@ mod tests {
 
     #[ignore] // Slow test – run only when compiled for release.
     #[test]
-    fn test_private_por_compound_poseidon() {
-        private_por_test_compound::<PoseidonHasher>();
+    fn test_private_por_compound_blake2s() {
+        private_por_test_compound::<Blake2sHasher>();
     }
 
     fn private_por_test_compound<H: Hasher>() {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
-        let leaves = 8;
+        let leaves = 6;
         let data: Vec<u8> = (0..leaves)
             .flat_map(|_| fr_into_bytes::<Bls12>(&Fr::random(rng)))
             .collect();
         let graph = BucketGraph::<H>::new(leaves, BASE_DEGREE, 0, new_seed()).unwrap();
-        let tree = graph.merkle_tree(None, data.as_slice()).unwrap();
+        let tree = graph.merkle_tree(data.as_slice()).unwrap();
 
         for i in 0..3 {
             let public_inputs = merklepor::PublicInputs {
@@ -476,7 +474,6 @@ mod tests {
                     private: true,
                 },
                 partitions: None,
-                priority: false,
             };
             let public_params = PoRCompound::<H>::setup(&setup_params).expect("setup failed");
 
@@ -489,8 +486,9 @@ mod tests {
                 &tree,
             );
 
-            let groth_params = PoRCompound::<H>::groth_params(&public_params.vanilla_params)
-                .expect("failed to generate groth params");
+            let groth_params =
+                PoRCompound::<H>::groth_params(Some(rng), &public_params.vanilla_params)
+                    .expect("failed to generate groth params");
 
             let proof = PoRCompound::<H>::prove(
                 &public_params,
@@ -527,9 +525,9 @@ mod tests {
     fn test_private_por_input_circuit_with_bls12_381() {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
-        let leaves = 8;
+        let leaves = 6;
 
-        for i in 0..leaves {
+        for i in 0..6 {
             // -- Basic Setup
 
             let data: Vec<u8> = (0..leaves)
@@ -538,7 +536,7 @@ mod tests {
 
             let graph =
                 BucketGraph::<PedersenHasher>::new(leaves, BASE_DEGREE, 0, new_seed()).unwrap();
-            let tree = graph.merkle_tree(None, data.as_slice()).unwrap();
+            let tree = graph.merkle_tree(data.as_slice()).unwrap();
 
             // -- MerklePoR
 

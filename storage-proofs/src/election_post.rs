@@ -4,8 +4,6 @@ use std::marker::PhantomData;
 
 use anyhow::{bail, ensure, Context};
 use byteorder::{ByteOrder, LittleEndian};
-use log::trace;
-use merkletree::store::StoreConfig;
 use paired::bls12_381::{Bls12, Fr};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -15,28 +13,27 @@ use crate::crypto::pedersen::{pedersen_md_no_padding_bits, Bits};
 use crate::drgraph::graph_height;
 use crate::error::{Error, Result};
 use crate::fr32::fr_into_bytes;
-use crate::hasher::{Domain, HashFunction, Hasher};
-use crate::measurements::{measure_op, Operation};
-use crate::merkle::{LCMerkleTree, MerkleProof};
+use crate::hasher::{Domain, Hasher};
+use crate::merkle::{MerkleProof, MerkleTree};
 use crate::parameter_cache::ParameterSetMetadata;
 use crate::proof::{NoRequirements, ProofScheme};
 use crate::sector::*;
+use crate::stacked::hash::hash3;
 use crate::util::NODE_SIZE;
+
+pub const POST_CHALLENGE_COUNT: usize = 40;
+pub const POST_CHALLENGED_NODES: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct SetupParams {
     /// Size of the sector in bytes.
     pub sector_size: u64,
-    pub challenge_count: usize,
-    pub challenged_nodes: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct PublicParams {
     /// Size of the sector in bytes.
     pub sector_size: u64,
-    pub challenge_count: usize,
-    pub challenged_nodes: usize,
 }
 
 impl ParameterSetMetadata for PublicParams {
@@ -44,8 +41,8 @@ impl ParameterSetMetadata for PublicParams {
         format!(
             "ElectionPoSt::PublicParams{{sector_size: {}, count: {}, nodes: {}}}",
             self.sector_size(),
-            self.challenge_count,
-            self.challenged_nodes,
+            POST_CHALLENGE_COUNT,
+            POST_CHALLENGED_NODES,
         )
     }
 
@@ -64,10 +61,11 @@ pub struct PublicInputs<T: Domain> {
     pub sector_challenge_index: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PrivateInputs<H: Hasher> {
-    pub tree: LCMerkleTree<H::Domain, H::Function>,
+    pub tree: MerkleTree<H::Domain, H::Function>,
     pub comm_c: H::Domain,
+    pub comm_q: H::Domain,
     pub comm_r_last: H::Domain,
 }
 
@@ -100,10 +98,11 @@ pub struct Proof<H: Hasher> {
     inclusion_proofs: Vec<MerkleProof<H>>,
     pub ticket: [u8; 32],
     pub comm_c: H::Domain,
+    pub comm_q: H::Domain,
 }
 
 impl<H: Hasher> Proof<H> {
-    pub fn leafs(&self) -> Vec<H::Domain> {
+    pub fn leafs(&self) -> Vec<&H::Domain> {
         self.inclusion_proofs
             .iter()
             .map(MerkleProof::leaf)
@@ -138,9 +137,9 @@ where
 }
 
 pub fn generate_candidates<H: Hasher>(
-    pub_params: &PublicParams,
+    sector_size: u64,
     challenged_sectors: &[SectorId],
-    trees: &BTreeMap<SectorId, LCMerkleTree<H::Domain, H::Function>>,
+    trees: &BTreeMap<SectorId, MerkleTree<H::Domain, H::Function>>,
     prover_id: &[u8; 32],
     randomness: &[u8; 32],
 ) -> Result<Vec<Candidate>> {
@@ -154,7 +153,7 @@ pub fn generate_candidates<H: Hasher>(
             };
 
             generate_candidate::<H>(
-                pub_params,
+                sector_size,
                 tree,
                 prover_id,
                 *sector_id,
@@ -166,30 +165,28 @@ pub fn generate_candidates<H: Hasher>(
 }
 
 fn generate_candidate<H: Hasher>(
-    pub_params: &PublicParams,
-    tree: &LCMerkleTree<H::Domain, H::Function>,
+    sector_size: u64,
+    tree: &MerkleTree<H::Domain, H::Function>,
     prover_id: &[u8; 32],
     sector_id: SectorId,
     randomness: &[u8; 32],
     sector_challenge_index: u64,
 ) -> Result<Candidate> {
     // 1. read the data for each challenge
-    let mut data = vec![0u8; pub_params.challenge_count * pub_params.challenged_nodes * NODE_SIZE];
-    for n in 0..pub_params.challenge_count {
+    let mut data = vec![0u8; POST_CHALLENGE_COUNT * POST_CHALLENGED_NODES * NODE_SIZE];
+    for n in 0..POST_CHALLENGE_COUNT {
         let challenge_start =
-            generate_leaf_challenge(pub_params, randomness, sector_challenge_index, n as u64)?;
+            generate_leaf_challenge(randomness, sector_challenge_index, n as u64, sector_size)?;
 
         let start = challenge_start as usize;
-        let end = start + pub_params.challenged_nodes;
+        let end = start + POST_CHALLENGED_NODES;
 
-        measure_op(Operation::PostReadChallengedRange, || {
-            tree.read_range_into(
-                start,
-                end,
-                &mut data[n * pub_params.challenged_nodes * NODE_SIZE
-                    ..(n + 1) * pub_params.challenged_nodes * NODE_SIZE],
-            )
-        })?;
+        tree.read_range_into(
+            start,
+            end,
+            &mut data[n * POST_CHALLENGED_NODES * NODE_SIZE
+                ..(n + 1) * POST_CHALLENGED_NODES * NODE_SIZE],
+        )?;
     }
 
     // 2. Ticket generation
@@ -200,9 +197,7 @@ fn generate_candidate<H: Hasher>(
     let list: [&[u8]; 4] = [&randomness[..], &prover_id[..], &sector_id_bytes[..], &data];
     let bits = Bits::new_many(list.iter());
 
-    let partial_ticket = measure_op(Operation::PostPartialTicketHash, || {
-        pedersen_md_no_padding_bits(bits)
-    });
+    let partial_ticket = pedersen_md_no_padding_bits(bits);
 
     // ticket = sha256(partial_ticket)
     let ticket = finalize_ticket(&partial_ticket);
@@ -260,19 +255,18 @@ pub fn generate_sector_challenge(
 
 /// Generate all challenged leaf ranges for a single sector, such that the range fits into the sector.
 pub fn generate_leaf_challenges(
-    pub_params: &PublicParams,
     randomness: &[u8; 32],
     sector_challenge_index: u64,
-    challenge_count: usize,
+    sector_size: u64,
 ) -> Result<Vec<u64>> {
-    let mut challenges = Vec::with_capacity(challenge_count);
+    let mut challenges = Vec::with_capacity(POST_CHALLENGE_COUNT);
 
-    for leaf_challenge_index in 0..challenge_count {
+    for leaf_challenge_index in 0..POST_CHALLENGE_COUNT {
         let challenge = generate_leaf_challenge(
-            pub_params,
             randomness,
             sector_challenge_index,
             leaf_challenge_index as u64,
+            sector_size,
         )?;
         challenges.push(challenge)
     }
@@ -282,15 +276,15 @@ pub fn generate_leaf_challenges(
 
 /// Generates challenge, such that the range fits into the sector.
 pub fn generate_leaf_challenge(
-    pub_params: &PublicParams,
     randomness: &[u8; 32],
     sector_challenge_index: u64,
     leaf_challenge_index: u64,
+    sector_size: u64,
 ) -> Result<u64> {
     ensure!(
-        pub_params.sector_size > pub_params.challenged_nodes as u64 * NODE_SIZE as u64,
+        sector_size > POST_CHALLENGED_NODES as u64 * NODE_SIZE as u64,
         "sector size {} is too small",
-        pub_params.sector_size
+        sector_size
     );
 
     let mut hasher = Sha256::new();
@@ -301,10 +295,10 @@ pub fn generate_leaf_challenge(
 
     let leaf_challenge = LittleEndian::read_u64(&hash.as_ref()[..8]);
 
-    let challenged_range_index = leaf_challenge
-        % (pub_params.sector_size / (pub_params.challenged_nodes * NODE_SIZE) as u64);
+    let challenged_range_index =
+        leaf_challenge % (sector_size / (POST_CHALLENGED_NODES * NODE_SIZE) as u64);
 
-    Ok(challenged_range_index * pub_params.challenged_nodes as u64)
+    Ok(challenged_range_index * POST_CHALLENGED_NODES as u64)
 }
 
 impl<'a, H: 'a + Hasher> ProofScheme<'a> for ElectionPoSt<'a, H> {
@@ -318,8 +312,6 @@ impl<'a, H: 'a + Hasher> ProofScheme<'a> for ElectionPoSt<'a, H> {
     fn setup(sp: &Self::SetupParams) -> Result<Self::PublicParams> {
         Ok(PublicParams {
             sector_size: sp.sector_size,
-            challenge_count: sp.challenge_count,
-            challenged_nodes: sp.challenged_nodes,
         })
     }
 
@@ -330,48 +322,35 @@ impl<'a, H: 'a + Hasher> ProofScheme<'a> for ElectionPoSt<'a, H> {
     ) -> Result<Self::Proof> {
         // 1. Inclusions proofs of all challenged leafs in all challenged ranges
         let tree = &priv_inputs.tree;
-        let tree_leafs = tree.leafs();
+        let sector_size = pub_params.sector_size;
 
-        trace!(
-            "Generating proof for tree of len {} with leafs {}, and cached_layers {}",
-            tree.len(),
-            tree_leafs,
-            StoreConfig::default_cached_above_base_layer(tree_leafs)
-        );
-        let inclusion_proofs = measure_op(Operation::PostInclusionProofs, || {
-            (0..pub_params.challenge_count)
-                .into_par_iter()
-                .flat_map(|n| {
-                    // TODO: replace unwrap with proper error handling
-                    let challenged_leaf_start = generate_leaf_challenge(
-                        pub_params,
-                        &pub_inputs.randomness,
-                        pub_inputs.sector_challenge_index,
-                        n as u64,
-                    )
-                    .unwrap();
-                    (0..pub_params.challenged_nodes)
-                        .into_par_iter()
-                        .map(move |i| {
-                            let (proof, _) = tree.gen_proof_and_partial_tree(
-                                challenged_leaf_start as usize + i,
-                                StoreConfig::default_cached_above_base_layer(tree_leafs),
-                            )?;
-                            Ok(MerkleProof::new_from_proof(&proof))
-                        })
+        let inclusion_proofs = (0..POST_CHALLENGE_COUNT)
+            .into_par_iter()
+            .flat_map(|n| {
+                // TODO: replace unwrap with proper error handling
+                let challenged_leaf_start = generate_leaf_challenge(
+                    &pub_inputs.randomness,
+                    pub_inputs.sector_challenge_index,
+                    n as u64,
+                    sector_size,
+                )
+                .unwrap();
+                (0..POST_CHALLENGED_NODES).into_par_iter().map(move |i| {
+                    Ok(MerkleProof::new_from_proof(
+                        &tree.gen_proof(challenged_leaf_start as usize + i)?,
+                    ))
                 })
-                .collect::<Result<Vec<_>>>()
-        })?;
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // 2. correct generation of the ticket from the partial_ticket (add this to the candidate)
-        let ticket = measure_op(Operation::PostFinalizeTicket, || {
-            finalize_ticket(&pub_inputs.partial_ticket)
-        });
+        let ticket = finalize_ticket(&pub_inputs.partial_ticket);
 
         Ok(Proof {
             inclusion_proofs,
             ticket,
             comm_c: priv_inputs.comm_c,
+            comm_q: priv_inputs.comm_q,
         })
     }
 
@@ -380,27 +359,30 @@ impl<'a, H: 'a + Hasher> ProofScheme<'a> for ElectionPoSt<'a, H> {
         pub_inputs: &Self::PublicInputs,
         proof: &Self::Proof,
     ) -> Result<bool> {
-        // verify that H(Comm_c || Comm_r_last) == Comm_R
+        let sector_size = pub_params.sector_size;
+
+        // verify that H(Comm_c || comm_q || Comm_r_last) == Comm_R
         // comm_r_last is the root of the proof
         let comm_r_last = proof.inclusion_proofs[0].root();
         let comm_c = proof.comm_c;
+        let comm_q = proof.comm_q;
         let comm_r = &pub_inputs.comm_r;
 
-        if AsRef::<[u8]>::as_ref(&H::Function::hash2(&comm_c, comm_r_last))
+        if AsRef::<[u8]>::as_ref(&hash3(comm_c, comm_q, comm_r_last))
             != AsRef::<[u8]>::as_ref(comm_r)
         {
             return Ok(false);
         }
 
-        for n in 0..pub_params.challenge_count {
+        for n in 0..POST_CHALLENGE_COUNT {
             let challenged_leaf_start = generate_leaf_challenge(
-                pub_params,
                 &pub_inputs.randomness,
                 pub_inputs.sector_challenge_index,
                 n as u64,
+                sector_size,
             )?;
-            for i in 0..pub_params.challenged_nodes {
-                let merkle_proof = &proof.inclusion_proofs[n * pub_params.challenged_nodes + i];
+            for i in 0..POST_CHALLENGED_NODES {
+                let merkle_proof = &proof.inclusion_proofs[n * POST_CHALLENGED_NODES + i];
 
                 // validate all comm_r_lasts match
                 if merkle_proof.root() != comm_r_last {
@@ -434,37 +416,21 @@ mod tests {
 
     use crate::drgraph::{new_seed, BucketGraph, Graph, BASE_DEGREE};
     use crate::fr32::fr_into_bytes;
-    use crate::hasher::{PedersenHasher, PoseidonHasher};
+    use crate::hasher::{Blake2sHasher, PedersenHasher, Sha256Hasher};
 
     fn test_election_post<H: Hasher>() {
-        use merkletree::store::{StoreConfig, StoreConfigDataVersion};
-
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
         let leaves = 32;
         let sector_size = leaves * 32;
 
-        let pub_params = PublicParams {
-            sector_size,
-            challenge_count: 40,
-            challenged_nodes: 1,
-        };
+        let pub_params = PublicParams { sector_size };
 
         let randomness: [u8; 32] = rng.gen();
         let prover_id: [u8; 32] = rng.gen();
 
         let mut sectors: Vec<SectorId> = Vec::new();
         let mut trees = BTreeMap::new();
-
-        // Construct and store an MT using a named DiskStore.
-        let temp_dir = tempdir::TempDir::new("level_cache_tree_v1").unwrap();
-        let temp_path = temp_dir.path();
-        let config = StoreConfig::new(
-            &temp_path,
-            String::from("test-lc-tree-v1"),
-            StoreConfig::default_cached_above_base_layer(leaves as usize),
-        );
-
         for i in 0..5 {
             sectors.push(i.into());
             let data: Vec<u8> = (0..leaves)
@@ -472,32 +438,20 @@ mod tests {
                 .collect();
 
             let graph = BucketGraph::<H>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
-
-            let cur_config =
-                StoreConfig::from_config(&config, format!("test-lc-tree-v1-{}", i), None);
-            let mut tree = graph
-                .merkle_tree(Some(cur_config.clone()), data.as_slice())
-                .unwrap();
-            let c = tree
-                .compact(cur_config.clone(), StoreConfigDataVersion::One as u32)
-                .unwrap();
-            assert_eq!(c, true);
-
-            let lctree = graph
-                .lcmerkle_tree(Some(cur_config), data.as_slice())
-                .unwrap();
-            trees.insert(i.into(), lctree);
+            let tree = graph.merkle_tree(data.as_slice()).unwrap();
+            trees.insert(i.into(), tree);
         }
 
         let candidates =
-            generate_candidates::<H>(&pub_params, &sectors, &trees, &prover_id, &randomness)
+            generate_candidates::<H>(sector_size, &sectors, &trees, &prover_id, &randomness)
                 .unwrap();
 
         let candidate = &candidates[0];
         let tree = trees.remove(&candidate.sector_id).unwrap();
         let comm_r_last = tree.root();
         let comm_c = H::Domain::random(rng);
-        let comm_r = H::Function::hash2(&comm_c, &comm_r_last);
+        let comm_q = H::Domain::random(rng);
+        let comm_r = Fr::from(hash3(comm_c, comm_q, comm_r_last)).into();
 
         let pub_inputs = PublicInputs {
             randomness,
@@ -511,6 +465,7 @@ mod tests {
         let priv_inputs = PrivateInputs::<H> {
             tree,
             comm_c,
+            comm_q,
             comm_r_last,
         };
 
@@ -529,7 +484,12 @@ mod tests {
     }
 
     #[test]
-    fn election_post_poseidon() {
-        test_election_post::<PoseidonHasher>();
+    fn election_post_sha256() {
+        test_election_post::<Sha256Hasher>();
+    }
+
+    #[test]
+    fn election_post_blake2s() {
+        test_election_post::<Blake2sHasher>();
     }
 }

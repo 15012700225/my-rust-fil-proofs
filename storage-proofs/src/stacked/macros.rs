@@ -1,4 +1,5 @@
 /// Checks that the two passed values are equal. If they are not equal it prints a trace and returns `false`.
+#[macro_export]
 macro_rules! check_eq {
     ($left:expr , $right:expr,) => ({
         check_eq!($left, $right)
@@ -12,7 +13,7 @@ macro_rules! check_eq {
                           \n{}\
                           \n",
                            pretty_assertions::Comparison::new(left_val, right_val));
-                    return false;
+                    return Ok(false);
                 }
             }
         }
@@ -27,7 +28,7 @@ macro_rules! check_eq {
                           \n",
                            format_args!($($arg)*),
                            pretty_assertions::Comparison::new(left_val, right_val));
-                    return false;
+                    return Ok(false);
                 }
             }
         }
@@ -35,11 +36,12 @@ macro_rules! check_eq {
 }
 
 /// Checks that the passed in value is true. If they are not equal it prints a trace and returns `false`.
+#[macro_export]
 macro_rules! check {
     ($val:expr) => {
         if !$val {
             trace!("expected {:?} to be true", dbg!($val));
-            return false;
+            return Ok(false);
         }
     };
 }

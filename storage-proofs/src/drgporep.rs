@@ -14,7 +14,7 @@ use crate::fr32::bytes_into_fr_repr_safe;
 use crate::hasher::{Domain, Hasher};
 use crate::merkle::{MerkleProof, MerkleTree};
 use crate::parameter_cache::ParameterSetMetadata;
-use crate::porep::{self, Data, PoRep};
+use crate::porep::{self, PoRep};
 use crate::proof::{NoRequirements, ProofScheme};
 use crate::util::{data_at_node, data_at_node_offset, NODE_SIZE};
 
@@ -412,7 +412,7 @@ where
                 return Ok(false);
             }
 
-            if !proof.nodes[i].proof.validate_data(unsealed) {
+            if !proof.nodes[i].proof.validate_data(&unsealed.into_bytes()) {
                 println!("invalid data for merkle path {:?}", unsealed);
                 return Ok(false);
             }
@@ -434,15 +434,13 @@ where
     fn replicate(
         pp: &Self::PublicParams,
         replica_id: &H::Domain,
-        mut data: Data<'a>,
+        data: &mut [u8],
         data_tree: Option<MerkleTree<H::Domain, H::Function>>,
-        config: Option<StoreConfig>,
+        _config: Option<StoreConfig>,
     ) -> Result<(porep::Tau<H::Domain>, porep::ProverAux<H>)> {
-        use crate::stacked::CacheKey;
-
         let tree_d = match data_tree {
             Some(tree) => tree,
-            None => pp.graph.merkle_tree(config.clone(), data.as_ref())?,
+            None => pp.graph.merkle_tree(data)?,
         };
 
         let graph = &pp.graph;
@@ -456,27 +454,18 @@ where
         let mut parents = vec![0; graph.degree()];
         for node in 0..graph.size() {
             graph.parents(node, &mut parents)?;
-            let key = graph.create_key(replica_id, node, &parents, data.as_ref(), None)?;
+            let key = graph.create_key(replica_id, node, &parents, data, None)?;
             let start = data_at_node_offset(node);
             let end = start + NODE_SIZE;
 
-            let node_data = H::Domain::try_from_bytes(&data.as_ref()[start..end])?;
+            let node_data = H::Domain::try_from_bytes(&data[start..end])?;
             let encoded = H::sloth_encode(key.as_ref(), &node_data)?;
 
-            encoded.write_bytes(&mut data.as_mut()[start..end])?;
+            encoded.write_bytes(&mut data[start..end])?;
         }
 
-        let tree_r_last_config = match config {
-            Some(config) => Some(StoreConfig::from_config(
-                &config,
-                CacheKey::CommRLastTree.to_string(),
-                None,
-            )),
-            None => None,
-        };
-
         let comm_d = tree_d.root();
-        let tree_r = pp.graph.merkle_tree(tree_r_last_config, data.as_ref())?;
+        let tree_r = pp.graph.merkle_tree(data)?;
         let comm_r = tree_r.root();
 
         Ok((
@@ -625,7 +614,7 @@ mod tests {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
         let replica_id: H::Domain = H::Domain::random(rng);
-        let data = vec![2u8; 32 * 4];
+        let data = vec![2u8; 32 * 3];
         // create a copy, so we can compare roundtrips
         let mut mmapped_data_copy = file_backed_mmap_from(&data);
 
@@ -645,17 +634,18 @@ mod tests {
         // MT for original data is always named tree-d, and it will be
         // referenced later in the process as such.
         use crate::stacked::CacheKey;
+        use merkletree::store::DEFAULT_CACHED_ABOVE_BASE_LAYER;
         let cache_dir = tempfile::tempdir().unwrap();
         let config = StoreConfig::new(
             cache_dir.path(),
             CacheKey::CommDTree.to_string(),
-            StoreConfig::default_cached_above_base_layer(data.len() / 32),
+            DEFAULT_CACHED_ABOVE_BASE_LAYER,
         );
 
         DrgPoRep::replicate(
             &pp,
             &replica_id,
-            (mmapped_data_copy.as_mut()).into(),
+            &mut mmapped_data_copy,
             None,
             Some(config.clone()),
         )
@@ -697,7 +687,7 @@ mod tests {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
         let replica_id: H::Domain = H::Domain::random(rng);
-        let nodes = 4;
+        let nodes = 3;
         let data = vec![2u8; 32 * nodes];
 
         // create a copy, so we can compare roundtrips
@@ -719,17 +709,18 @@ mod tests {
         // MT for original data is always named tree-d, and it will be
         // referenced later in the process as such.
         use crate::stacked::CacheKey;
+        use merkletree::store::DEFAULT_CACHED_ABOVE_BASE_LAYER;
         let cache_dir = tempfile::tempdir().unwrap();
         let config = StoreConfig::new(
             cache_dir.path(),
             CacheKey::CommDTree.to_string(),
-            StoreConfig::default_cached_above_base_layer(data.len() / 32),
+            DEFAULT_CACHED_ABOVE_BASE_LAYER,
         );
 
         DrgPoRep::replicate(
             &pp,
             &replica_id,
-            (mmapped_data_copy.as_mut()).into(),
+            &mut mmapped_data_copy,
             None,
             Some(config.clone()),
         )
@@ -815,17 +806,18 @@ mod tests {
             // MT for original data is always named tree-d, and it will be
             // referenced later in the process as such.
             use crate::stacked::CacheKey;
+            use merkletree::store::DEFAULT_CACHED_ABOVE_BASE_LAYER;
             let cache_dir = tempfile::tempdir().unwrap();
             let config = StoreConfig::new(
                 cache_dir.path(),
                 CacheKey::CommDTree.to_string(),
-                StoreConfig::default_cached_above_base_layer(nodes),
+                DEFAULT_CACHED_ABOVE_BASE_LAYER,
             );
 
             let (tau, aux) = DrgPoRep::<H, _>::replicate(
                 &pp,
                 &replica_id,
-                (mmapped_data_copy.as_mut()).into(),
+                &mut mmapped_data_copy,
                 None,
                 Some(config),
             )
@@ -971,25 +963,25 @@ mod tests {
         prove_verify {
             prove_verify_32_2_1(2, 1);
 
-            prove_verify_32_3_1(4, 1);
-            prove_verify_32_3_2(4, 2);
+            prove_verify_32_3_1(3, 1);
+            prove_verify_32_3_2(3, 2);
 
-            prove_verify_32_10_1(16, 1);
-            prove_verify_32_10_2(16, 2);
-            prove_verify_32_10_3(16, 3);
-            prove_verify_32_10_4(16, 4);
-            prove_verify_32_10_5(16, 5);
+            prove_verify_32_10_1(10, 1);
+            prove_verify_32_10_2(10, 2);
+            prove_verify_32_10_3(10, 3);
+            prove_verify_32_10_4(10, 4);
+            prove_verify_32_10_5(10, 5);
         }
     }
 
     #[test]
     fn test_drgporep_verifies_using_challenge() {
-        prove_verify_wrong_challenge(8, 1);
+        prove_verify_wrong_challenge(5, 1);
     }
 
     #[test]
     fn test_drgporep_verifies_parents() {
         // Challenge a node (3) that doesn't have all the same parents.
-        prove_verify_wrong_parents(8, 5);
+        prove_verify_wrong_parents(7, 4);
     }
 }

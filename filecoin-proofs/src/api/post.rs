@@ -1,32 +1,34 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::prelude::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, ensure, Context, Result};
 use bincode::deserialize;
-use log::{info, trace};
-use merkletree::store::{LevelCacheStore, Store, StoreConfig};
+use log::info;
+use merkletree::merkle::{get_merkle_tree_leafs, MerkleTree};
+use merkletree::store::{DiskStore, Store, StoreConfig, DEFAULT_CACHED_ABOVE_BASE_LAYER};
 use paired::bls12_381::Bls12;
 use rayon::prelude::*;
 use storage_proofs::circuit::election_post::ElectionPoStCompound;
 use storage_proofs::circuit::multi_proof::MultiProof;
 use storage_proofs::compound_proof::{self, CompoundProof};
+use storage_proofs::drgraph::DefaultTreeHasher;
 use storage_proofs::election_post;
-pub use storage_proofs::election_post::Candidate;
 use storage_proofs::fr32::bytes_into_fr;
 use storage_proofs::hasher::Hasher;
 use storage_proofs::proof::NoRequirements;
 use storage_proofs::sector::*;
 use storage_proofs::stacked::CacheKey;
 
-use crate::api::util::{as_safe_commitment, get_tree_leafs, get_tree_size};
+use crate::api::util::as_safe_commitment;
 use crate::caches::{get_post_params, get_post_verifying_key};
-use crate::constants::DefaultTreeHasher;
 use crate::parameters::post_setup_params;
 use crate::types::{
-    ChallengeSeed, Commitment, LCTree, PersistentAux, PoStConfig, ProverId, TemporaryAux,
+    ChallengeSeed, Commitment, PersistentAux, PoStConfig, ProverId, SectorSize, Tree,
 };
+
+pub use storage_proofs::election_post::Candidate;
 
 /// The minimal information required about a replica, in order to be able to generate
 /// a PoSt over it.
@@ -78,10 +80,6 @@ impl PrivateReplicaInfo {
         })
     }
 
-    pub fn cache_dir_path(&self) -> &Path {
-        self.cache_dir.as_path()
-    }
-
     pub fn safe_comm_r(&self) -> Result<<DefaultTreeHasher as Hasher>::Domain> {
         as_safe_commitment(&self.comm_r, "comm_r")
     }
@@ -90,29 +88,25 @@ impl PrivateReplicaInfo {
         Ok(self.aux.comm_c)
     }
 
+    pub fn safe_comm_q(&self) -> Result<<DefaultTreeHasher as Hasher>::Domain> {
+        Ok(self.aux.comm_q)
+    }
+
     pub fn safe_comm_r_last(&self) -> Result<<DefaultTreeHasher as Hasher>::Domain> {
         Ok(self.aux.comm_r_last)
     }
 
     /// Generate the merkle tree of this particular replica.
-    pub fn merkle_tree(&self, tree_size: usize, tree_leafs: usize) -> Result<LCTree> {
-        trace!(
-            "post: tree size {}, tree leafs {}, cached above base {}",
-            tree_size,
-            tree_leafs,
-            StoreConfig::default_cached_above_base_layer(tree_leafs)
-        );
+    pub fn merkle_tree(&self, tree_size: usize, tree_leafs: usize) -> Result<Tree> {
         let mut config = StoreConfig::new(
-            self.cache_dir_path(),
+            &self.cache_dir,
             CacheKey::CommRLastTree.to_string(),
-            StoreConfig::default_cached_above_base_layer(tree_leafs),
+            DEFAULT_CACHED_ABOVE_BASE_LAYER,
         );
         config.size = Some(tree_size);
-
-        let tree_r_last_store: LevelCacheStore<<DefaultTreeHasher as Hasher>::Domain, _> =
-            LevelCacheStore::new_from_disk(tree_size, &config)?;
-        let tree_r_last: LCTree =
-            merkletree::merkle::MerkleTree::from_data_store(tree_r_last_store, tree_leafs)?;
+        let tree_r_last_store: DiskStore<<DefaultTreeHasher as Hasher>::Domain> =
+            DiskStore::new_from_disk(tree_size, &config)?;
+        let tree_r_last: Tree = MerkleTree::from_data_store(tree_r_last_store, tree_leafs)?;
 
         Ok(tree_r_last)
     }
@@ -149,6 +143,13 @@ impl PublicReplicaInfo {
     }
 }
 
+fn get_tree_size(sector_size: SectorSize) -> usize {
+    let sector_size = u64::from(sector_size);
+    let elems = sector_size as usize / std::mem::size_of::<<DefaultTreeHasher as Hasher>::Domain>();
+
+    2 * elems - 1
+}
+
 /// Generates proof-of-spacetime candidates for ElectionPoSt.
 ///
 /// # Arguments
@@ -168,14 +169,10 @@ pub fn generate_candidates(
 ) -> Result<Vec<Candidate>> {
     info!("generate_candidates:start");
 
-    ensure!(!replicas.is_empty(), "Replicas must not be empty");
-    ensure!(challenge_count > 0, "Challenge count must be > 0");
-
     let vanilla_params = post_setup_params(post_config);
     let setup_params = compound_proof::SetupParams {
         vanilla_params,
         partitions: None,
-        priority: false,
     };
     let public_params: compound_proof::PublicParams<
         election_post::ElectionPoSt<DefaultTreeHasher>,
@@ -213,29 +210,12 @@ pub fn generate_candidates(
     unique_challenged_replicas.sort_unstable(); // dedup requires a sorted list
     unique_challenged_replicas.dedup();
 
-    let tree_size = get_tree_size::<<DefaultTreeHasher as Hasher>::Domain>(post_config.sector_size);
-    let tree_leafs =
-        get_tree_leafs::<<DefaultTreeHasher as Hasher>::Domain>(post_config.sector_size);
+    let tree_size = get_tree_size(post_config.sector_size);
+    let tree_leafs = get_merkle_tree_leafs(tree_size);
 
     let unique_trees_res: Vec<_> = unique_challenged_replicas
         .into_par_iter()
         .map(|(id, replica)| {
-            // Ensure that any associated cached data persisted is
-            // discarded and our tree is compacted by this point.
-            let t_aux = {
-                let mut aux_bytes = vec![];
-                let f_aux_path = replica.cache_dir_path().join(CacheKey::TAux.to_string());
-                let mut f_aux = File::open(&f_aux_path)
-                    .with_context(|| format!("could not open path={:?}", f_aux_path))?;
-                f_aux
-                    .read_to_end(&mut aux_bytes)
-                    .with_context(|| format!("could not read from path={:?}", f_aux_path))?;
-
-                deserialize(&aux_bytes)
-            }?;
-
-            TemporaryAux::compact(t_aux)?;
-
             replica
                 .merkle_tree(tree_size, tree_leafs)
                 .map(|tree| (*id, tree))
@@ -243,11 +223,10 @@ pub fn generate_candidates(
         .collect();
 
     // resolve results
-    let trees: BTreeMap<SectorId, LCTree> =
-        unique_trees_res.into_iter().collect::<Result<_, _>>()?;
+    let trees: BTreeMap<SectorId, Tree> = unique_trees_res.into_iter().collect::<Result<_, _>>()?;
 
     let candidates = election_post::generate_candidates::<DefaultTreeHasher>(
-        &public_params.vanilla_params,
+        public_params.vanilla_params.sector_size,
         &challenged_sectors,
         &trees,
         &prover_id,
@@ -289,22 +268,18 @@ pub fn generate_post(
 
     let sector_count = replicas.len() as u64;
     ensure!(sector_count > 0, "Must supply at least one replica");
-    ensure!(!winners.is_empty(), "Winners must not be empty");
-    ensure!(!replicas.is_empty(), "Replicas must not be empty");
 
     let vanilla_params = post_setup_params(post_config);
     let setup_params = compound_proof::SetupParams {
         vanilla_params,
         partitions: None,
-        priority: post_config.priority,
     };
     let pub_params: compound_proof::PublicParams<election_post::ElectionPoSt<DefaultTreeHasher>> =
         ElectionPoStCompound::setup(&setup_params)?;
     let groth_params = get_post_params(post_config)?;
 
-    let tree_size = get_tree_size::<<DefaultTreeHasher as Hasher>::Domain>(post_config.sector_size);
-    let tree_leafs =
-        get_tree_leafs::<<DefaultTreeHasher as Hasher>::Domain>(post_config.sector_size);
+    let tree_size = get_tree_size(post_config.sector_size);
+    let tree_leafs = get_merkle_tree_leafs(tree_size);
 
     let mut proofs = Vec::with_capacity(winners.len());
 
@@ -327,10 +302,12 @@ pub fn generate_post(
             };
 
             let comm_c = replica.safe_comm_c()?;
+            let comm_q = replica.safe_comm_q()?;
             let comm_r_last = replica.safe_comm_r_last()?;
             let priv_inputs = election_post::PrivateInputs::<DefaultTreeHasher> {
                 tree,
                 comm_c,
+                comm_q,
                 comm_r_last,
             };
 
@@ -374,9 +351,6 @@ pub fn verify_post(
 
     let sector_count = replicas.len() as u64;
     ensure!(sector_count > 0, "Must supply at least one replica");
-    ensure!(!winners.is_empty(), "Winners must not be empty");
-    ensure!(!proofs.is_empty(), "Proofs must not be empty");
-    ensure!(!replicas.is_empty(), "Replicas must not be empty");
     ensure!(
         winners.len() == proofs.len(),
         "Missmatch between winners and proofs"
@@ -387,7 +361,6 @@ pub fn verify_post(
     let setup_params = compound_proof::SetupParams {
         vanilla_params,
         partitions: None,
-        priority: false,
     };
     let pub_params: compound_proof::PublicParams<election_post::ElectionPoSt<DefaultTreeHasher>> =
         ElectionPoStCompound::setup(&setup_params)?;

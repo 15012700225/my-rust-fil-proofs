@@ -8,13 +8,13 @@ use paired::bls12_381::{Bls12, Fr};
 
 use crate::circuit::constraint;
 use crate::circuit::por::{PoRCircuit, PoRCompound};
+use crate::circuit::stacked::hash::hash2;
 use crate::circuit::variables::Root;
 use crate::compound_proof::{CircuitComponent, CompoundProof};
 use crate::crypto::pedersen::JJ_PARAMS;
 use crate::drgraph;
 use crate::error::Result;
-use crate::hasher::types::PoseidonEngine;
-use crate::hasher::{HashFunction, Hasher};
+use crate::hasher::Hasher;
 use crate::merklepor;
 use crate::parameter_cache::{CacheableParameters, ParameterSetMetadata};
 use crate::proof::ProofScheme;
@@ -45,7 +45,7 @@ impl<E: JubjubEngine, C: Circuit<E>, P: ParameterSetMetadata, H: Hasher>
     CacheableParameters<E, C, P> for RationalPoStCompound<H>
 {
     fn cache_prefix() -> String {
-        format!("proof-of-spacetime-rational-{}", H::name())
+        String::from("proof-of-spacetime-rational")
     }
 }
 
@@ -116,7 +116,7 @@ where
         let leafs: Vec<_> = vanilla_proof
             .leafs()
             .iter()
-            .map(|c| Some((*c).into()))
+            .map(|c| Some((**c).into()))
             .collect();
 
         let paths: Vec<Vec<_>> = vanilla_proof
@@ -160,7 +160,7 @@ where
     }
 }
 
-impl<'a, E: JubjubEngine + PoseidonEngine, H: Hasher> Circuit<E> for RationalPoStCircuit<'a, E, H> {
+impl<'a, E: JubjubEngine, H: Hasher> Circuit<E> for RationalPoStCircuit<'a, E, H> {
     fn synthesize<CS: ConstraintSystem<E>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
         let params = self.params;
         let comm_rs = self.comm_rs;
@@ -205,11 +205,19 @@ impl<'a, E: JubjubEngine + PoseidonEngine, H: Hasher> Circuit<E> for RationalPoS
 
             // Verify H(Comm_C || comm_r_last) == comm_r
             {
-                let hash_num = H::Function::hash2_circuit(
+                // Allocate comm_c as booleansn
+                let comm_c_bits =
+                    comm_c_num.to_bits_le(cs.namespace(|| format!("comm_c_{}_bits", i)))?;
+
+                // Allocate comm_r_last as booleans
+                let comm_r_last_bits = comm_r_last_num
+                    .to_bits_le(cs.namespace(|| format!("comm_r_last_{}_bits", i)))?;
+
+                let hash_num = hash2(
                     cs.namespace(|| format!("H_comm_c_comm_r_last_{}", i)),
-                    &comm_c_num,
-                    &comm_r_last_num,
                     params,
+                    &comm_c_bits,
+                    &comm_r_last_bits,
                 )?;
 
                 // Check actual equality
@@ -235,7 +243,7 @@ impl<'a, E: JubjubEngine + PoseidonEngine, H: Hasher> Circuit<E> for RationalPoS
     }
 }
 
-impl<'a, E: JubjubEngine + PoseidonEngine, H: Hasher> RationalPoStCircuit<'a, E, H> {
+impl<'a, E: JubjubEngine, H: Hasher> RationalPoStCircuit<'a, E, H> {
     #[allow(clippy::type_complexity)]
     pub fn synthesize<CS: ConstraintSystem<E>>(
         cs: &mut CS,
@@ -274,22 +282,14 @@ mod tests {
     use crate::crypto::pedersen::JJ_PARAMS;
     use crate::drgraph::{new_seed, BucketGraph, Graph, BASE_DEGREE};
     use crate::fr32::fr_into_bytes;
-    use crate::hasher::{Domain, HashFunction, Hasher, PedersenHasher, PoseidonHasher};
+    use crate::hasher::{pedersen::*, Domain};
     use crate::proof::{NoRequirements, ProofScheme};
     use crate::rational_post::{self, derive_challenges, RationalPoSt};
     use crate::sector::OrderedSectorSet;
+    use crate::stacked::hash::hash2;
 
     #[test]
-    fn test_rational_post_circuit_pedersen() {
-        test_rational_post_circuit::<PedersenHasher>(16_490);
-    }
-
-    #[test]
-    fn test_rational_post_circuit_poseidon() {
-        test_rational_post_circuit::<PoseidonHasher>(5_150);
-    }
-
-    fn test_rational_post_circuit<H: Hasher>(expected_constraints: usize) {
+    fn test_rational_post_circuit_with_bls12_381() {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
         let leaves = 32;
@@ -308,11 +308,11 @@ mod tests {
             .flat_map(|_| fr_into_bytes::<Bls12>(&Fr::random(rng)))
             .collect();
 
-        let graph1 = BucketGraph::<H>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
-        let tree1 = graph1.merkle_tree(None, data1.as_slice()).unwrap();
+        let graph1 = BucketGraph::<PedersenHasher>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
+        let tree1 = graph1.merkle_tree(data1.as_slice()).unwrap();
 
-        let graph2 = BucketGraph::<H>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
-        let tree2 = graph2.merkle_tree(None, data2.as_slice()).unwrap();
+        let graph2 = BucketGraph::<PedersenHasher>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
+        let tree2 = graph2.merkle_tree(data2.as_slice()).unwrap();
 
         let faults = OrderedSectorSet::new();
         let mut sectors = OrderedSectorSet::new();
@@ -328,12 +328,15 @@ mod tests {
             .map(|c| comm_r_lasts_raw[u64::from(c.sector) as usize])
             .collect();
 
-        let comm_cs: Vec<H::Domain> = challenges.iter().map(|_c| H::Domain::random(rng)).collect();
+        let comm_cs: Vec<PedersenDomain> = challenges
+            .iter()
+            .map(|_c| PedersenDomain::random(rng))
+            .collect();
 
-        let comm_rs: Vec<_> = comm_cs
+        let comm_rs: Vec<PedersenDomain> = comm_cs
             .iter()
             .zip(comm_r_lasts.iter())
-            .map(|(comm_c, comm_r_last)| H::Function::hash2(comm_c, comm_r_last))
+            .map(|(comm_c, comm_r_last)| hash2(comm_c, comm_r_last).into())
             .collect();
 
         let pub_inputs = rational_post::PublicInputs {
@@ -346,16 +349,16 @@ mod tests {
         trees.insert(0.into(), &tree1);
         trees.insert(1.into(), &tree2);
 
-        let priv_inputs = rational_post::PrivateInputs::<H> {
+        let priv_inputs = rational_post::PrivateInputs::<PedersenHasher> {
             trees: &trees,
             comm_cs: &comm_cs,
             comm_r_lasts: &comm_r_lasts,
         };
 
-        let proof = RationalPoSt::<H>::prove(&pub_params, &pub_inputs, &priv_inputs)
+        let proof = RationalPoSt::<PedersenHasher>::prove(&pub_params, &pub_inputs, &priv_inputs)
             .expect("proving failed");
 
-        let is_valid = RationalPoSt::<H>::verify(&pub_params, &pub_inputs, &proof)
+        let is_valid = RationalPoSt::<PedersenHasher>::verify(&pub_params, &pub_inputs, &proof)
             .expect("verification failed");
         assert!(is_valid);
 
@@ -370,11 +373,11 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let leafs: Vec<_> = proof.leafs().iter().map(|l| Some((*l).into())).collect();
+        let leafs: Vec<_> = proof.leafs().iter().map(|l| Some((**l).into())).collect();
 
         let mut cs = TestConstraintSystem::<Bls12>::new();
 
-        let instance = RationalPoStCircuit::<_, H> {
+        let instance = RationalPoStCircuit::<_, PedersenHasher> {
             params: &*JJ_PARAMS,
             leafs,
             paths,
@@ -391,16 +394,15 @@ mod tests {
         assert!(cs.is_satisfied(), "constraints not satisfied");
 
         assert_eq!(cs.num_inputs(), 5, "wrong number of inputs");
-        assert_eq!(
-            cs.num_constraints(),
-            expected_constraints,
-            "wrong number of constraints"
-        );
+        assert_eq!(cs.num_constraints(), 16_496, "wrong number of constraints");
         assert_eq!(cs.get_input(0, "ONE"), Fr::one());
 
-        let generated_inputs =
-            RationalPoStCompound::<H>::generate_public_inputs(&pub_inputs, &pub_params, None)
-                .unwrap();
+        let generated_inputs = RationalPoStCompound::<PedersenHasher>::generate_public_inputs(
+            &pub_inputs,
+            &pub_params,
+            None,
+        )
+        .unwrap();
         let expected_inputs = cs.get_inputs();
 
         for ((input, label), generated_input) in
@@ -418,17 +420,7 @@ mod tests {
 
     #[ignore] // Slow test – run only when compiled for release.
     #[test]
-    fn rational_post_test_compound_pedersen() {
-        rational_post_test_compound::<PedersenHasher>();
-    }
-
-    #[ignore] // Slow test – run only when compiled for release.
-    #[test]
-    fn rational_post_test_compound_poseidon() {
-        rational_post_test_compound::<PoseidonHasher>();
-    }
-
-    fn rational_post_test_compound<H: Hasher>() {
+    fn rational_post_test_compound() {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
         let leaves = 32;
@@ -441,10 +433,10 @@ mod tests {
                 challenges_count,
             },
             partitions: None,
-            priority: true,
         };
 
-        let pub_params = RationalPoStCompound::<H>::setup(&setup_params).expect("setup failed");
+        let pub_params =
+            RationalPoStCompound::<PedersenHasher>::setup(&setup_params).expect("setup failed");
 
         let data1: Vec<u8> = (0..leaves)
             .flat_map(|_| fr_into_bytes::<Bls12>(&Fr::random(rng)))
@@ -453,11 +445,11 @@ mod tests {
             .flat_map(|_| fr_into_bytes::<Bls12>(&Fr::random(rng)))
             .collect();
 
-        let graph1 = BucketGraph::<H>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
-        let tree1 = graph1.merkle_tree(None, data1.as_slice()).unwrap();
+        let graph1 = BucketGraph::<PedersenHasher>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
+        let tree1 = graph1.merkle_tree(data1.as_slice()).unwrap();
 
-        let graph2 = BucketGraph::<H>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
-        let tree2 = graph2.merkle_tree(None, data2.as_slice()).unwrap();
+        let graph2 = BucketGraph::<PedersenHasher>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
+        let tree2 = graph2.merkle_tree(data2.as_slice()).unwrap();
 
         let faults = OrderedSectorSet::new();
         let mut sectors = OrderedSectorSet::new();
@@ -474,12 +466,15 @@ mod tests {
             .map(|c| comm_r_lasts_raw[u64::from(c.sector) as usize])
             .collect();
 
-        let comm_cs: Vec<H::Domain> = challenges.iter().map(|_c| H::Domain::random(rng)).collect();
+        let comm_cs: Vec<PedersenDomain> = challenges
+            .iter()
+            .map(|_c| PedersenDomain::random(rng))
+            .collect();
 
-        let comm_rs: Vec<_> = comm_cs
+        let comm_rs: Vec<PedersenDomain> = comm_cs
             .iter()
             .zip(comm_r_lasts.iter())
-            .map(|(comm_c, comm_r_last)| H::Function::hash2(comm_c, comm_r_last))
+            .map(|(comm_c, comm_r_last)| hash2(comm_c, comm_r_last).into())
             .collect();
 
         let pub_inputs = rational_post::PublicInputs {
@@ -492,22 +487,32 @@ mod tests {
         trees.insert(0.into(), &tree1);
         trees.insert(1.into(), &tree2);
 
-        let priv_inputs = rational_post::PrivateInputs::<H> {
+        let priv_inputs = rational_post::PrivateInputs::<PedersenHasher> {
             trees: &trees,
             comm_r_lasts: &comm_r_lasts,
             comm_cs: &comm_cs,
         };
 
-        let gparams = RationalPoStCompound::<H>::groth_params(&pub_params.vanilla_params)
-            .expect("failed to create groth params");
+        let gparams = RationalPoStCompound::<PedersenHasher>::groth_params(
+            Some(rng),
+            &pub_params.vanilla_params,
+        )
+        .expect("failed to create groth params");
 
-        let proof =
-            RationalPoStCompound::<H>::prove(&pub_params, &pub_inputs, &priv_inputs, &gparams)
-                .expect("proving failed");
+        let proof = RationalPoStCompound::<PedersenHasher>::prove(
+            &pub_params,
+            &pub_inputs,
+            &priv_inputs,
+            &gparams,
+        )
+        .expect("proving failed");
 
-        let (circuit, inputs) =
-            RationalPoStCompound::<H>::circuit_for_test(&pub_params, &pub_inputs, &priv_inputs)
-                .unwrap();
+        let (circuit, inputs) = RationalPoStCompound::<PedersenHasher>::circuit_for_test(
+            &pub_params,
+            &pub_inputs,
+            &priv_inputs,
+        )
+        .unwrap();
 
         {
             let mut cs = TestConstraintSystem::new();
@@ -517,9 +522,13 @@ mod tests {
             assert!(cs.verify(&inputs));
         }
 
-        let verified =
-            RationalPoStCompound::<H>::verify(&pub_params, &pub_inputs, &proof, &NoRequirements)
-                .expect("failed while verifying");
+        let verified = RationalPoStCompound::<PedersenHasher>::verify(
+            &pub_params,
+            &pub_inputs,
+            &proof,
+            &NoRequirements,
+        )
+        .expect("failed while verifying");
 
         assert!(verified);
     }

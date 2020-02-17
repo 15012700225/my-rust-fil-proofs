@@ -3,16 +3,16 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, ensure, Context, Result};
-use merkletree::store::StoreConfig;
+use merkletree::store::{StoreConfig, DEFAULT_CACHED_ABOVE_BASE_LAYER};
+use storage_proofs::drgraph::DefaultTreeHasher;
 use storage_proofs::hasher::Hasher;
-use storage_proofs::porep::PoRep;
 use storage_proofs::sector::SectorId;
 use storage_proofs::stacked::{generate_replica_id, CacheKey, StackedDrg};
 use tempfile::tempfile;
 
-use crate::api::util::{as_safe_commitment, get_tree_leafs};
+use crate::api::util::as_safe_commitment;
 use crate::constants::{
-    DefaultPieceHasher, DefaultTreeHasher,
+    DefaultPieceHasher,
     MINIMUM_RESERVED_BYTES_FOR_PIECE_IN_FULLY_ALIGNED_SECTOR as MINIMUM_PIECE_SIZE,
 };
 use crate::fr32::{write_padded, write_unpadded};
@@ -80,14 +80,12 @@ pub fn get_unsealed_range<T: Into<PathBuf> + AsRef<Path>>(
         .with_context(|| format!("could not create output_path={:?}", output_path.as_ref()))?;
     let mut buf_writer = BufWriter::new(f_out);
 
-    let tree_leafs =
-        get_tree_leafs::<<DefaultPieceHasher as Hasher>::Domain>(porep_config.sector_size);
     // MT for original data is always named tree-d, and it will be
     // referenced later in the process as such.
     let config = StoreConfig::new(
         cache_path,
         CacheKey::CommDTree.to_string(),
-        StoreConfig::default_cached_above_base_layer(tree_leafs),
+        DEFAULT_CACHED_ABOVE_BASE_LAYER,
     );
     let pp = public_params(
         PaddedBytesAmount::from(porep_config),
@@ -97,20 +95,19 @@ pub fn get_unsealed_range<T: Into<PathBuf> + AsRef<Path>>(
     let offset_padded: PaddedBytesAmount = UnpaddedBytesAmount::from(offset).into();
     let num_bytes_padded: PaddedBytesAmount = num_bytes.into();
 
-    let unsealed_all = StackedDrg::<DefaultTreeHasher, DefaultPieceHasher>::extract_all(
+    let unsealed = StackedDrg::<DefaultTreeHasher, DefaultPieceHasher>::extract_range(
         &pp,
         &replica_id,
         &data,
         Some(config),
+        offset_padded.into(),
+        num_bytes_padded.into(),
     )?;
-    let start: usize = offset_padded.into();
-    let end = start + usize::from(num_bytes_padded);
-    let unsealed = &unsealed_all[start..end];
 
     // If the call to `extract_range` was successful, the `unsealed` vector must
     // have a length which equals `num_bytes_padded`. The byte at its 0-index
     // byte will be the the byte at index `offset_padded` in the sealed sector.
-    let written = write_unpadded(unsealed, &mut buf_writer, 0, num_bytes.into())
+    let written = write_unpadded(&unsealed, &mut buf_writer, 0, num_bytes.into())
         .with_context(|| format!("could not write to output_path={:?}", output_path.as_ref()))?;
 
     Ok(UnpaddedBytesAmount(written as u64))
@@ -330,7 +327,9 @@ mod tests {
     use storage_proofs::fr32::bytes_into_fr;
     use tempfile::NamedTempFile;
 
-    use crate::constants::{POREP_PARTITIONS, SECTOR_SIZE_ONE_KIB, SINGLE_PARTITION_PROOF_LEN};
+    use crate::constants::{
+        DEFAULT_POREP_PROOF_PARTITIONS, SECTOR_SIZE_ONE_KIB, SINGLE_PARTITION_PROOF_LEN,
+    };
     use crate::types::{PoStConfig, SectorSize};
 
     static INIT_LOGGER: Once = Once::new();
@@ -354,13 +353,7 @@ mod tests {
             let result = verify_seal(
                 PoRepConfig {
                     sector_size: SectorSize(SECTOR_SIZE_ONE_KIB),
-                    partitions: PoRepProofPartitions(
-                        *POREP_PARTITIONS
-                            .read()
-                            .unwrap()
-                            .get(&SECTOR_SIZE_ONE_KIB)
-                            .unwrap(),
-                    ),
+                    partitions: DEFAULT_POREP_PROOF_PARTITIONS,
                 },
                 not_convertible_to_fr_bytes,
                 convertible_to_fr_bytes,
@@ -388,13 +381,7 @@ mod tests {
             let result = verify_seal(
                 PoRepConfig {
                     sector_size: SectorSize(SECTOR_SIZE_ONE_KIB),
-                    partitions: PoRepProofPartitions(
-                        *POREP_PARTITIONS
-                            .read()
-                            .unwrap()
-                            .get(&SECTOR_SIZE_ONE_KIB)
-                            .unwrap(),
-                    ),
+                    partitions: DEFAULT_POREP_PROOF_PARTITIONS,
                 },
                 convertible_to_fr_bytes,
                 not_convertible_to_fr_bytes,
@@ -442,9 +429,6 @@ mod tests {
         let result = verify_post(
             PoStConfig {
                 sector_size: SectorSize(SECTOR_SIZE_ONE_KIB),
-                challenge_count: crate::constants::POST_CHALLENGE_COUNT,
-                challenged_nodes: crate::constants::POST_CHALLENGED_NODES,
-                priority: false,
             },
             &[0; 32],
             1,
@@ -506,9 +490,7 @@ mod tests {
         let mut unseal_file = NamedTempFile::new()?;
         let config = PoRepConfig {
             sector_size: SectorSize(sector_size.clone()),
-            partitions: PoRepProofPartitions(
-                *POREP_PARTITIONS.read().unwrap().get(&sector_size).unwrap(),
-            ),
+            partitions: DEFAULT_POREP_PROOF_PARTITIONS,
         };
 
         let cache_dir = tempfile::tempdir().unwrap();
@@ -517,28 +499,21 @@ mod tests {
         let seed = rng.gen();
         let sector_id = SectorId::from(12);
 
-        let phase1_output = seal_pre_commit_phase1(
+        let pre_commit_output = seal_pre_commit(
             config,
             cache_dir.path(),
-            staged_sector_file.path(),
-            sealed_sector_file.path(),
+            &staged_sector_file.path(),
+            &sealed_sector_file.path(),
             prover_id,
             sector_id,
             ticket,
             &piece_infos,
         )?;
 
-        let pre_commit_output = seal_pre_commit_phase2(
-            config,
-            phase1_output,
-            cache_dir.path(),
-            sealed_sector_file.path(),
-        )?;
-
         let comm_d = pre_commit_output.comm_d.clone();
         let comm_r = pre_commit_output.comm_r.clone();
 
-        let phase1_output = seal_commit_phase1(
+        let commit_output = seal_commit(
             config,
             cache_dir.path(),
             prover_id,
@@ -548,7 +523,6 @@ mod tests {
             pre_commit_output,
             &piece_infos,
         )?;
-        let commit_output = seal_commit_phase2(config, phase1_output, prover_id, sector_id)?;
 
         let _ = get_unsealed_range(
             config,
@@ -571,7 +545,7 @@ mod tests {
         assert_eq!(contents.len(), 508);
         assert_eq!(&piece_bytes[508..], &contents[..]);
 
-        let computed_comm_d = compute_comm_d(config.sector_size, &piece_infos)?;
+        let computed_comm_d = compute_comm_d(config, &piece_infos)?;
 
         assert_eq!(
             comm_d, computed_comm_d,

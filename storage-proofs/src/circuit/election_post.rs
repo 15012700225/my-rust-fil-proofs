@@ -11,6 +11,7 @@ use paired::bls12_381::{Bls12, Fr};
 use crate::circuit::constraint;
 use crate::circuit::pedersen::pedersen_md_no_padding;
 use crate::circuit::por::{PoRCircuit, PoRCompound};
+use crate::circuit::stacked::hash::hash3;
 use crate::circuit::uint64::UInt64;
 use crate::circuit::variables::Root;
 use crate::compound_proof::{CircuitComponent, CompoundProof};
@@ -19,8 +20,7 @@ use crate::drgraph;
 use crate::election_post::{self, ElectionPoSt};
 use crate::error::Result;
 use crate::fr32::fr_into_bytes;
-use crate::hasher::types::PoseidonEngine;
-use crate::hasher::{HashFunction, Hasher};
+use crate::hasher::Hasher;
 use crate::merklepor;
 use crate::parameter_cache::{CacheableParameters, ParameterSetMetadata};
 use crate::proof::ProofScheme;
@@ -33,6 +33,7 @@ pub struct ElectionPoStCircuit<'a, E: JubjubEngine, H: Hasher> {
     pub params: &'a E::Params,
     pub comm_r: Option<E::Fr>,
     pub comm_c: Option<E::Fr>,
+    pub comm_q: Option<E::Fr>,
     pub comm_r_last: Option<E::Fr>,
     pub leafs: Vec<Option<E::Fr>>,
     #[allow(clippy::type_complexity)]
@@ -55,7 +56,7 @@ impl<E: JubjubEngine, C: Circuit<E>, P: ParameterSetMetadata, H: Hasher>
     CacheableParameters<E, C, P> for ElectionPoStCompound<H>
 {
     fn cache_prefix() -> String {
-        format!("proof-of-spacetime-election-{}", H::name())
+        String::from("proof-of-spacetime-election")
     }
 }
 
@@ -83,20 +84,20 @@ where
             private: true,
         };
 
-        // 1. Inputs for verifying comm_r = H(comm_c || comm_r_last)
+        // 1. Inputs for verifying comm_r = H(comm_c || comm_q || comm_r_last)
 
         inputs.push(pub_inputs.comm_r.into());
 
         // 2. Inputs for verifying inclusion paths
 
-        for n in 0..pub_params.challenge_count {
+        for n in 0..election_post::POST_CHALLENGE_COUNT {
             let challenged_leaf_start = election_post::generate_leaf_challenge(
-                &pub_params,
                 &pub_inputs.randomness,
                 pub_inputs.sector_challenge_index,
                 n as u64,
+                pub_params.sector_size,
             )?;
-            for i in 0..pub_params.challenged_nodes {
+            for i in 0..election_post::POST_CHALLENGED_NODES {
                 let por_pub_inputs = merklepor::PublicInputs {
                     commitment: None,
                     challenge: challenged_leaf_start as usize + i,
@@ -125,12 +126,13 @@ where
     ) -> Result<ElectionPoStCircuit<'a, Bls12, H>> {
         let comm_r = pub_in.comm_r.into();
         let comm_c = vanilla_proof.comm_c.into();
+        let comm_q = vanilla_proof.comm_q.into();
         let comm_r_last = vanilla_proof.comm_r_last().into();
 
         let leafs: Vec<_> = vanilla_proof
             .leafs()
             .iter()
-            .map(|c| Some((*c).into()))
+            .map(|c| Some((**c).into()))
             .collect();
 
         let paths: Vec<Vec<_>> = vanilla_proof
@@ -144,6 +146,7 @@ where
             leafs,
             comm_r: Some(comm_r),
             comm_c: Some(comm_c),
+            comm_q: Some(comm_q),
             comm_r_last: Some(comm_r_last),
             paths,
             partial_ticket: Some(pub_in.partial_ticket),
@@ -157,7 +160,8 @@ where
     fn blank_circuit(
         pub_params: &<ElectionPoSt<'a, H> as ProofScheme<'a>>::PublicParams,
     ) -> ElectionPoStCircuit<'a, Bls12, H> {
-        let challenges_count = pub_params.challenged_nodes * pub_params.challenge_count;
+        let challenges_count =
+            election_post::POST_CHALLENGED_NODES * election_post::POST_CHALLENGE_COUNT;
         let height = drgraph::graph_height(pub_params.sector_size as usize / NODE_SIZE);
 
         let leafs = vec![None; challenges_count];
@@ -167,6 +171,7 @@ where
             params: &*JJ_PARAMS,
             comm_r: None,
             comm_c: None,
+            comm_q: None,
             comm_r_last: None,
             partial_ticket: None,
             leafs,
@@ -179,17 +184,22 @@ where
     }
 }
 
-impl<'a, E: JubjubEngine + PoseidonEngine, H: Hasher> Circuit<E> for ElectionPoStCircuit<'a, E, H> {
+impl<'a, E: JubjubEngine, H: Hasher> Circuit<E> for ElectionPoStCircuit<'a, E, H> {
     fn synthesize<CS: ConstraintSystem<E>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
         let params = self.params;
         let comm_r = self.comm_r;
         let comm_c = self.comm_c;
+        let comm_q = self.comm_q;
         let comm_r_last = self.comm_r_last;
         let leafs = self.leafs;
         let paths = self.paths;
         let partial_ticket = self.partial_ticket;
 
         assert_eq!(paths.len(), leafs.len());
+        assert_eq!(
+            paths.len(),
+            election_post::POST_CHALLENGED_NODES * election_post::POST_CHALLENGE_COUNT
+        );
 
         // 1. Verify comm_r
 
@@ -205,6 +215,12 @@ impl<'a, E: JubjubEngine + PoseidonEngine, H: Hasher> Circuit<E> for ElectionPoS
                 .ok_or_else(|| SynthesisError::AssignmentMissing)
         })?;
 
+        let comm_q_num = num::AllocatedNum::alloc(cs.namespace(|| "comm_q"), || {
+            comm_q
+                .map(Into::into)
+                .ok_or_else(|| SynthesisError::AssignmentMissing)
+        })?;
+
         let comm_r_num = num::AllocatedNum::alloc(cs.namespace(|| "comm_r"), || {
             comm_r
                 .map(Into::into)
@@ -213,19 +229,30 @@ impl<'a, E: JubjubEngine + PoseidonEngine, H: Hasher> Circuit<E> for ElectionPoS
 
         comm_r_num.inputize(cs.namespace(|| "comm_r_input"))?;
 
-        // Verify H(Comm_C || comm_r_last) == comm_r
+        // Verify H(Comm_C || comm_q || comm_r_last) == comm_r
         {
-            let hash_num = H::Function::hash2_circuit(
-                cs.namespace(|| "H_comm_c_comm_r_last"),
-                &comm_c_num,
-                &comm_r_last_num,
+            // Allocate comm_c as booleans
+            let comm_c_bits = comm_c_num.to_bits_le(cs.namespace(|| "comm_c_bits"))?;
+
+            // Allocate comm_q as booleans
+            let comm_q_bits = comm_q_num.to_bits_le(cs.namespace(|| "comm_q_bits"))?;
+
+            // Allocate comm_r_last as booleans
+            let comm_r_last_bits =
+                comm_r_last_num.to_bits_le(cs.namespace(|| "comm_r_last_bits"))?;
+
+            let hash_num = hash3(
+                cs.namespace(|| "H_comm_c_comm_q_comm_r_last"),
                 params,
+                &comm_c_bits,
+                &comm_q_bits,
+                &comm_r_last_bits,
             )?;
 
             // Check actual equality
             constraint::equal(
                 cs,
-                || "enforce_comm_c_comm_r_last_hash_comm_r",
+                || "enforce_comm_c_comm_q_comm_r_last_hash_comm_r",
                 &comm_r_num,
                 &hash_num,
             );
@@ -328,32 +355,22 @@ mod tests {
     use std::collections::BTreeMap;
 
     use ff::Field;
-    use merkletree::store::{StoreConfig, StoreConfigDataVersion};
     use rand::{Rng, SeedableRng};
     use rand_xorshift::XorShiftRng;
 
-    use crate::circuit::metric::MetricCS;
     use crate::circuit::test::*;
     use crate::compound_proof;
     use crate::crypto::pedersen::JJ_PARAMS;
     use crate::drgraph::{new_seed, BucketGraph, Graph, BASE_DEGREE};
     use crate::election_post::{self, ElectionPoSt};
     use crate::fr32::fr_into_bytes;
-    use crate::hasher::{Domain, HashFunction, Hasher, PedersenHasher, PoseidonHasher};
+    use crate::hasher::{pedersen::*, Domain};
     use crate::proof::{NoRequirements, ProofScheme};
     use crate::sector::SectorId;
+    use crate::stacked::hash::hash3;
 
     #[test]
-    fn test_election_post_circuit_pedersen() {
-        test_election_post_circuit::<PedersenHasher>(333_750);
-    }
-
-    #[test]
-    fn test_election_post_circuit_poseidon() {
-        test_election_post_circuit::<PoseidonHasher>(143_805);
-    }
-
-    fn test_election_post_circuit<H: Hasher>(expected_constraints: usize) {
+    fn test_election_post_circuit() {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
         let leaves = 32;
@@ -362,50 +379,23 @@ mod tests {
         let randomness: [u8; 32] = rng.gen();
         let prover_id: [u8; 32] = rng.gen();
 
-        let pub_params = election_post::PublicParams {
-            sector_size,
-            challenge_count: 40,
-            challenged_nodes: 1,
-        };
+        let pub_params = election_post::PublicParams { sector_size };
 
         let mut sectors: Vec<SectorId> = Vec::new();
         let mut trees = BTreeMap::new();
-
-        // Construct and store an MT using a named DiskStore.
-        let temp_dir = tempdir::TempDir::new("level_cache_tree_v1").unwrap();
-        let temp_path = temp_dir.path();
-        let config = StoreConfig::new(
-            &temp_path,
-            String::from("test-lc-tree-v1"),
-            StoreConfig::default_cached_above_base_layer(leaves as usize),
-        );
-
         for i in 0..5 {
             sectors.push(i.into());
             let data: Vec<u8> = (0..leaves)
                 .flat_map(|_| fr_into_bytes::<Bls12>(&Fr::random(rng)))
                 .collect();
 
-            let graph = BucketGraph::<H>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
-
-            let cur_config =
-                StoreConfig::from_config(&config, format!("test-lc-tree-v1-{}", i), None);
-            let mut tree = graph
-                .merkle_tree(Some(cur_config.clone()), data.as_slice())
-                .unwrap();
-            let c = tree
-                .compact(cur_config.clone(), StoreConfigDataVersion::One as u32)
-                .unwrap();
-            assert_eq!(c, true);
-
-            let lctree = graph
-                .lcmerkle_tree(Some(cur_config), data.as_slice())
-                .unwrap();
-            trees.insert(i.into(), lctree);
+            let graph = BucketGraph::<PedersenHasher>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
+            let tree = graph.merkle_tree(data.as_slice()).unwrap();
+            trees.insert(i.into(), tree);
         }
 
-        let candidates = election_post::generate_candidates::<H>(
-            &pub_params,
+        let candidates = election_post::generate_candidates::<PedersenHasher>(
+            sector_size,
             &sectors,
             &trees,
             &prover_id,
@@ -416,8 +406,9 @@ mod tests {
         let candidate = &candidates[0];
         let tree = trees.remove(&candidate.sector_id).unwrap();
         let comm_r_last = tree.root();
-        let comm_c = H::Domain::random(rng);
-        let comm_r = H::Function::hash2(&comm_c, &comm_r_last);
+        let comm_c = PedersenDomain::random(rng);
+        let comm_q = PedersenDomain::random(rng);
+        let comm_r = Fr::from(hash3(comm_c, comm_q, comm_r_last)).into();
 
         let pub_inputs = election_post::PublicInputs {
             randomness,
@@ -428,16 +419,17 @@ mod tests {
             sector_challenge_index: 0,
         };
 
-        let priv_inputs = election_post::PrivateInputs::<H> {
+        let priv_inputs = election_post::PrivateInputs::<PedersenHasher> {
             tree,
             comm_c,
+            comm_q,
             comm_r_last,
         };
 
-        let proof = ElectionPoSt::<H>::prove(&pub_params, &pub_inputs, &priv_inputs)
+        let proof = ElectionPoSt::<PedersenHasher>::prove(&pub_params, &pub_inputs, &priv_inputs)
             .expect("proving failed");
 
-        let is_valid = ElectionPoSt::<H>::verify(&pub_params, &pub_inputs, &proof)
+        let is_valid = ElectionPoSt::<PedersenHasher>::verify(&pub_params, &pub_inputs, &proof)
             .expect("verification failed");
         assert!(is_valid);
 
@@ -452,16 +444,17 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let leafs: Vec<_> = proof.leafs().iter().map(|l| Some((*l).into())).collect();
+        let leafs: Vec<_> = proof.leafs().iter().map(|l| Some((**l).into())).collect();
 
         let mut cs = TestConstraintSystem::<Bls12>::new();
 
-        let instance = ElectionPoStCircuit::<_, H> {
+        let instance = ElectionPoStCircuit::<_, PedersenHasher> {
             params: &*JJ_PARAMS,
             leafs,
             paths,
             comm_r: Some(comm_r.into()),
             comm_c: Some(comm_c.into()),
+            comm_q: Some(comm_q.into()),
             comm_r_last: Some(comm_r_last.into()),
             partial_ticket: Some(candidate.partial_ticket.into()),
             randomness: bytes_into_bits_opt(&randomness[..]),
@@ -477,16 +470,15 @@ mod tests {
         assert!(cs.is_satisfied(), "constraints not satisfied");
 
         assert_eq!(cs.num_inputs(), 43, "wrong number of inputs");
-        assert_eq!(
-            cs.num_constraints(),
-            expected_constraints,
-            "wrong number of constraints"
-        );
+        assert_eq!(cs.num_constraints(), 335_127, "wrong number of constraints");
         assert_eq!(cs.get_input(0, "ONE"), Fr::one());
 
-        let generated_inputs =
-            ElectionPoStCompound::<H>::generate_public_inputs(&pub_inputs, &pub_params, None)
-                .unwrap();
+        let generated_inputs = ElectionPoStCompound::<PedersenHasher>::generate_public_inputs(
+            &pub_inputs,
+            &pub_params,
+            None,
+        )
+        .unwrap();
         let expected_inputs = cs.get_inputs();
 
         for ((input, label), generated_input) in
@@ -504,17 +496,7 @@ mod tests {
 
     #[ignore] // Slow test – run only when compiled for release.
     #[test]
-    fn election_post_test_compound_pedersen() {
-        election_post_test_compound::<PedersenHasher>();
-    }
-
-    #[ignore] // Slow test – run only when compiled for release.
-    #[test]
-    fn election_post_test_compound_poseidon() {
-        election_post_test_compound::<PoseidonHasher>();
-    }
-
-    fn election_post_test_compound<H: Hasher>() {
+    fn election_post_test_compound() {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
         let leaves = 32;
@@ -523,55 +505,25 @@ mod tests {
         let prover_id: [u8; 32] = rng.gen();
 
         let setup_params = compound_proof::SetupParams {
-            vanilla_params: election_post::SetupParams {
-                sector_size,
-                challenge_count: 40,
-                challenged_nodes: 1,
-            },
+            vanilla_params: election_post::SetupParams { sector_size },
             partitions: None,
-            priority: true,
         };
 
         let mut sectors: Vec<SectorId> = Vec::new();
         let mut trees = BTreeMap::new();
-
-        // Construct and store an MT using a named DiskStore.
-        let temp_dir = tempdir::TempDir::new("level_cache_tree_v1").unwrap();
-        let temp_path = temp_dir.path();
-        let config = StoreConfig::new(
-            &temp_path,
-            String::from("test-lc-tree-v1"),
-            StoreConfig::default_cached_above_base_layer(leaves as usize),
-        );
-
         for i in 0..5 {
             sectors.push(i.into());
             let data: Vec<u8> = (0..leaves)
                 .flat_map(|_| fr_into_bytes::<Bls12>(&Fr::random(rng)))
                 .collect();
 
-            let graph = BucketGraph::<H>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
-
-            let cur_config =
-                StoreConfig::from_config(&config, format!("test-lc-tree-v1-{}", i), None);
-            let mut tree = graph
-                .merkle_tree(Some(cur_config.clone()), data.as_slice())
-                .unwrap();
-            let c = tree
-                .compact(cur_config.clone(), StoreConfigDataVersion::One as u32)
-                .unwrap();
-            assert_eq!(c, true);
-
-            let lctree = graph
-                .lcmerkle_tree(Some(cur_config), data.as_slice())
-                .unwrap();
-            trees.insert(i.into(), lctree);
+            let graph = BucketGraph::<PedersenHasher>::new(32, BASE_DEGREE, 0, new_seed()).unwrap();
+            let tree = graph.merkle_tree(data.as_slice()).unwrap();
+            trees.insert(i.into(), tree);
         }
 
-        let pub_params = ElectionPoStCompound::<H>::setup(&setup_params).expect("setup failed");
-
-        let candidates = election_post::generate_candidates::<H>(
-            &pub_params.vanilla_params,
+        let candidates = election_post::generate_candidates::<PedersenHasher>(
+            sector_size,
             &sectors,
             &trees,
             &prover_id,
@@ -582,8 +534,9 @@ mod tests {
         let candidate = &candidates[0];
         let tree = trees.remove(&candidate.sector_id).unwrap();
         let comm_r_last = tree.root();
-        let comm_c = H::Domain::random(rng);
-        let comm_r = H::Function::hash2(&comm_c, &comm_r_last);
+        let comm_c = PedersenDomain::random(rng);
+        let comm_q = PedersenDomain::random(rng);
+        let comm_r = Fr::from(hash3(comm_c, comm_q, comm_r_last)).into();
 
         let pub_inputs = election_post::PublicInputs {
             randomness,
@@ -594,11 +547,15 @@ mod tests {
             sector_challenge_index: 0,
         };
 
-        let priv_inputs = election_post::PrivateInputs::<H> {
+        let priv_inputs = election_post::PrivateInputs::<PedersenHasher> {
             tree,
             comm_c,
+            comm_q,
             comm_r_last,
         };
+
+        let pub_params =
+            ElectionPoStCompound::<PedersenHasher>::setup(&setup_params).expect("setup failed");
 
         {
             let (circuit, inputs) =
@@ -627,9 +584,9 @@ mod tests {
                 ElectionPoStCompound::circuit_for_test(&pub_params, &pub_inputs, &priv_inputs)
                     .unwrap();
             let blank_circuit =
-                ElectionPoStCompound::<H>::blank_circuit(&pub_params.vanilla_params);
+                ElectionPoStCompound::<PedersenHasher>::blank_circuit(&pub_params.vanilla_params);
 
-            let mut cs_blank = MetricCS::new();
+            let mut cs_blank = TestConstraintSystem::new();
             blank_circuit
                 .synthesize(&mut cs_blank)
                 .expect("failed to synthesize");
@@ -644,9 +601,11 @@ mod tests {
                 assert_eq!(a, b, "failed at chunk {}", i);
             }
         }
-        let blank_groth_params =
-            ElectionPoStCompound::<H>::groth_params(&pub_params.vanilla_params)
-                .expect("failed to generate groth params");
+        let blank_groth_params = ElectionPoStCompound::<PedersenHasher>::groth_params(
+            Some(rng),
+            &pub_params.vanilla_params,
+        )
+        .expect("failed to generate groth params");
 
         let proof = ElectionPoStCompound::prove(
             &pub_params,

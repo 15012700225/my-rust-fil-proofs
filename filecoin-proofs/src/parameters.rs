@@ -1,14 +1,15 @@
-use std::sync::atomic::Ordering;
-
-use anyhow::{ensure, Result};
+use anyhow::{anyhow, ensure, Result};
+use storage_proofs::drgraph::{DefaultTreeHasher, BASE_DEGREE};
 use storage_proofs::election_post::{self, ElectionPoSt};
 use storage_proofs::proof::ProofScheme;
-use storage_proofs::stacked::{self, LayerChallenges, StackedDrg};
+use storage_proofs::stacked::{self, LayerChallenges, StackedConfig, StackedDrg, EXP_DEGREE};
 
 use crate::constants::{
-    DefaultPieceHasher, DefaultTreeHasher, DRG_DEGREE, EXP_DEGREE, LAYERS, POREP_MINIMUM_CHALLENGES,
+    DefaultPieceHasher, POREP_WINDOW_MINIMUM_CHALLENGES, POREP_WRAPPER_MINIMUM_CHALLENGES,
 };
 use crate::types::{PaddedBytesAmount, PoStConfig};
+
+const LAYERS: usize = 4; // TODO: correct params;
 
 const DRG_SEED: [u8; 28] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -28,6 +29,19 @@ pub fn public_params(
     )?)
 }
 
+pub fn window_size_nodes_for_sector_bytes(sector_size: PaddedBytesAmount) -> Result<usize> {
+    use crate::constants::*;
+
+    match u64::from(sector_size) {
+        SECTOR_SIZE_ONE_KIB => Ok(WINDOW_SIZE_NODES_ONE_KIB),
+        SECTOR_SIZE_16_MIB => Ok(WINDOW_SIZE_NODES_16_MIB),
+        SECTOR_SIZE_256_MIB => Ok(WINDOW_SIZE_NODES_256_MIB),
+        SECTOR_SIZE_1_GIB => Ok(WINDOW_SIZE_NODES_1_GIB),
+        SECTOR_SIZE_32_GIB => Ok(WINDOW_SIZE_NODES_32_GIB),
+        _ => Err(anyhow!("Unknown sector size {:?}", sector_size)),
+    }
+}
+
 pub fn post_public_params(post_config: PoStConfig) -> Result<PostPublicParams> {
     ElectionPoSt::<DefaultTreeHasher>::setup(&post_setup_params(post_config))
 }
@@ -37,8 +51,6 @@ pub fn post_setup_params(post_config: PoStConfig) -> PostSetupParams {
 
     election_post::SetupParams {
         sector_size: size.into(),
-        challenge_count: post_config.challenge_count,
-        challenged_nodes: post_config.challenged_nodes,
     }
 }
 
@@ -46,20 +58,16 @@ pub fn setup_params(
     sector_bytes: PaddedBytesAmount,
     partitions: usize,
 ) -> Result<stacked::SetupParams> {
-    let layer_challenges = select_challenges(
-        partitions,
-        *POREP_MINIMUM_CHALLENGES
-            .read()
-            .unwrap()
-            .get(&u64::from(sector_bytes))
-            .expect("unknown sector size") as usize,
-        *LAYERS
-            .read()
-            .unwrap()
-            .get(&u64::from(sector_bytes))
-            .expect("unknown sector size"),
-    )?;
-    let sector_bytes = u64::from(sector_bytes);
+    let window_challenges = select_challenges(partitions, POREP_WINDOW_MINIMUM_CHALLENGES, LAYERS)?;
+    let wrapper_challenges =
+        select_challenges(partitions, POREP_WRAPPER_MINIMUM_CHALLENGES, LAYERS)?;
+    let window_size_nodes = window_size_nodes_for_sector_bytes(sector_bytes)?;
+    let sector_bytes = usize::from(sector_bytes);
+
+    let config = StackedConfig {
+        window_challenges,
+        wrapper_challenges,
+    };
 
     ensure!(
         sector_bytes % 32 == 0,
@@ -67,13 +75,21 @@ pub fn setup_params(
         sector_bytes,
     );
 
-    let nodes = (sector_bytes / 32) as usize;
+    ensure!(
+        sector_bytes % window_size_nodes * 32 == 0,
+        "sector_bytes ({}) must be a multiple of the window size ({})",
+        sector_bytes,
+        window_size_nodes * 32
+    );
+
+    let nodes = sector_bytes / 32;
     Ok(stacked::SetupParams {
         nodes,
-        degree: DRG_DEGREE.load(Ordering::Relaxed) as usize,
-        expansion_degree: EXP_DEGREE.load(Ordering::Relaxed) as usize,
+        degree: BASE_DEGREE,
+        expansion_degree: EXP_DEGREE,
         seed: DRG_SEED,
-        layer_challenges,
+        config,
+        window_size_nodes,
     })
 }
 
@@ -83,10 +99,10 @@ fn select_challenges(
     layers: usize,
 ) -> Result<LayerChallenges> {
     let mut count = 1;
-    let mut guess = LayerChallenges::new(layers, count);
+    let mut guess = LayerChallenges::new(layers, count)?;
     while partitions * guess.challenges_count_all() < minimum_total_challenges {
         count += 1;
-        guess = LayerChallenges::new(layers, count);
+        guess = LayerChallenges::new(layers, count)?;
     }
     Ok(guess)
 }
@@ -98,7 +114,7 @@ mod tests {
     #[test]
     fn partition_layer_challenges_test() {
         let f = |partitions| {
-            select_challenges(partitions, 12, 11)
+            select_challenges(partitions, 12, LAYERS)
                 .unwrap()
                 .challenges_count_all()
         };

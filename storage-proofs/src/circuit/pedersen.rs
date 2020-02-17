@@ -28,7 +28,7 @@ where
     );
 
     let mut chunks = data.chunks(PEDERSEN_BLOCK_SIZE);
-    let mut cur: Vec<Boolean> = chunks.next().unwrap().to_vec();
+    let mut cur: Vec<Boolean> = chunks.nth(0).unwrap().to_vec();
     let chunks_len = chunks.len();
 
     for (i, block) in chunks.enumerate() {
@@ -136,7 +136,6 @@ mod tests {
             (96, 2751),   // 96 bytes
             (128, 4126),  // 128 bytes
             (160, 5501),  // 160 bytes
-            (256, 9626),  // 160 bytes
             (512, 20626), // 512 bytes
         ];
 

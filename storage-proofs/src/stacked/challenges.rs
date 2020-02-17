@@ -1,21 +1,25 @@
+use anyhow::{ensure, Context};
 use num_bigint::BigUint;
 use num_traits::cast::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::error::Result;
 use crate::hasher::Domain;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerChallenges {
     /// How many layers we are generating challenges for.
     layers: usize,
-    /// The maximum count of challenges
-    max_count: usize,
+    count: usize,
 }
 
 impl LayerChallenges {
-    pub const fn new(layers: usize, max_count: usize) -> Self {
-        LayerChallenges { layers, max_count }
+    pub fn new(layers: usize, count: usize) -> Result<Self> {
+        ensure!(layers > 1, "layers must be at least 2");
+        ensure!(count > 0, "there must be at least 1 challenge");
+
+        Ok(LayerChallenges { layers, count })
     }
 
     pub fn layers(&self) -> usize {
@@ -23,17 +27,17 @@ impl LayerChallenges {
     }
 
     pub fn challenges_count_all(&self) -> usize {
-        self.max_count
+        self.count
     }
 
     /// Derive all challenges.
-    pub fn derive<D: Domain>(
+    pub fn derive_all<D: Domain>(
         &self,
         leaves: usize,
         replica_id: &D,
         seed: &[u8; 32],
         k: u8,
-    ) -> Vec<usize> {
+    ) -> Result<Vec<usize>> {
         self.derive_internal(self.challenges_count_all(), leaves, replica_id, seed, k)
     }
 
@@ -44,8 +48,8 @@ impl LayerChallenges {
         replica_id: &D,
         seed: &[u8; 32],
         k: u8,
-    ) -> Vec<usize> {
-        assert!(leaves > 2, "Too few leaves: {}", leaves);
+    ) -> Result<Vec<usize>> {
+        ensure!(leaves > 2, "Too few leaves: {}", leaves);
 
         (0..challenges_count)
             .map(|i| {
@@ -64,8 +68,8 @@ impl LayerChallenges {
                 let big_mod_challenge = big_challenge % (leaves - 1);
                 let big_mod_challenge = big_mod_challenge
                     .to_usize()
-                    .expect("`big_mod_challenge` exceeds size of `usize`");
-                big_mod_challenge + 1
+                    .context("`big_mod_challenge` exceeds size of `usize`")?;
+                Ok(big_mod_challenge + 1)
             })
             .collect()
     }
@@ -88,7 +92,7 @@ mod test {
         let n = 200;
         let layers = 100;
 
-        let challenges = LayerChallenges::new(layers, n);
+        let challenges = LayerChallenges::new(layers, n).unwrap();
         let leaves = 1 << 30;
         let rng = &mut thread_rng();
         let replica_id: PedersenDomain = PedersenDomain::random(rng);
@@ -98,10 +102,10 @@ mod test {
 
         let mut layers_with_duplicates = 0;
 
-        for _layer in 1..=layers {
+        for _ in 1..=layers {
             let mut histogram = HashMap::new();
             for k in 0..partitions {
-                let challenges = challenges.derive(leaves, &replica_id, &seed, k as u8);
+                let challenges = challenges.derive_all(leaves, &replica_id, &seed, k as u8);
 
                 for challenge in challenges {
                     let counter = histogram.entry(challenge).or_insert(0);
@@ -134,16 +138,17 @@ mod test {
         let layers = 100;
         let total_challenges = n * partitions;
 
-        for _layer in 1..=layers {
-            let one_partition_challenges = LayerChallenges::new(layers, total_challenges).derive(
-                leaves,
-                &replica_id,
-                &seed,
-                0,
-            );
+        for _ in 1..=layers {
+            let one_partition_challenges = LayerChallenges::new(layers, total_challenges)
+                .unwrap()
+                .derive_all(leaves, &replica_id, &seed, 0)
+                .unwrap();
             let many_partition_challenges = (0..partitions)
                 .flat_map(|k| {
-                    LayerChallenges::new(layers, n).derive(leaves, &replica_id, &seed, k as u8)
+                    LayerChallenges::new(layers, n)
+                        .unwrap()
+                        .derive_all(leaves, &replica_id, &seed, k as u8)
+                        .unwrap()
                 })
                 .collect::<Vec<_>>();
 

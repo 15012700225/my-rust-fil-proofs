@@ -6,6 +6,7 @@ use fil_sapling_crypto::jubjub::JubjubEngine;
 use fs2::FileExt;
 use itertools::Itertools;
 use log::info;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -13,9 +14,10 @@ use std::env;
 use std::fs::{self, create_dir_all, File};
 use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Bump this when circuits change to invalidate the cache.
-pub const VERSION: usize = 22;
+pub const VERSION: usize = 20;
 
 pub const PARAMETER_CACHE_ENV_VAR: &str = "FIL_PROOFS_PARAMETER_CACHE";
 pub const PARAMETER_CACHE_DIR: &str = "/var/tmp/filecoin-proof-parameters/";
@@ -26,7 +28,7 @@ pub const VERIFYING_KEY_EXT: &str = "vk";
 #[derive(Debug)]
 struct LockedFile(File);
 
-// TODO: use in memory lock as well, as file locks do not guarantee exclusive access across OSes.
+// TODO: use in memory lock as well, as file locks do not guarantee exclusive access acros OSes.
 
 impl LockedFile {
     pub fn open_exclusive_read<P: AsRef<Path>>(p: P) -> io::Result<Self> {
@@ -179,43 +181,43 @@ where
             .or_else(|_| write_cached_metadata(&meta_path, Self::cache_meta(pub_params)))
     }
 
-    fn get_groth_params(circuit: C, pub_params: &P) -> Result<groth16::MappedParameters<E>> {
+    fn get_groth_params<R: RngCore>(
+        rng: Option<&mut R>,
+        circuit: C,
+        pub_params: &P,
+    ) -> Result<groth16::Parameters<E>> {
         let id = Self::cache_identifier(pub_params);
 
-        // This is used for testing only, if parameters are otherwise unavailable.
         let generate = || -> Result<_> {
-            use std::time::Instant;
-
-            info!("Actually generating groth params. (id: {})", &id);
-            let mut rng = rand::thread_rng();
-            let start = Instant::now();
-            let parameters = groth16::generate_random_parameters::<E, _, _>(circuit, &mut rng)?;
-            let generation_time = start.elapsed();
-            info!(
-                "groth_parameter_generation_time: {:?} (id: {})",
-                generation_time, &id
-            );
-            Ok(parameters)
+            if let Some(rng) = rng {
+                info!("Actually generating groth params. (id: {})", &id);
+                let start = Instant::now();
+                let parameters = groth16::generate_random_parameters::<E, _, _>(circuit, rng)?;
+                let generation_time = start.elapsed();
+                info!(
+                    "groth_parameter_generation_time: {:?} (id: {})",
+                    generation_time, &id
+                );
+                Ok(parameters)
+            } else {
+                bail!("No cached parameters found for {}", id);
+            }
         };
 
-        // load or generate Groth parameter mappings
+        // generate (or load) Groth parameters
         let cache_path = ensure_ancestor_dirs_exist(parameter_cache_params_path(&id))?;
-        match read_cached_params(&cache_path) {
-            Ok(x) => Ok(x),
-            Err(_) => {
-                write_cached_params(&cache_path, generate()?).unwrap_or_else(|e| {
-                    panic!("{}: failed to write generated parameters to cache", e)
-                });
-                Ok(read_cached_params(&cache_path)?)
-            }
-        }
+        read_cached_params(&cache_path).or_else(|_| write_cached_params(&cache_path, generate()?))
     }
 
-    fn get_verifying_key(circuit: C, pub_params: &P) -> Result<groth16::VerifyingKey<E>> {
+    fn get_verifying_key<R: RngCore>(
+        rng: Option<&mut R>,
+        circuit: C,
+        pub_params: &P,
+    ) -> Result<groth16::VerifyingKey<E>> {
         let id = Self::cache_identifier(pub_params);
 
         let generate = || -> Result<groth16::VerifyingKey<E>> {
-            let groth_params = Self::get_groth_params(circuit, pub_params)?;
+            let groth_params = Self::get_groth_params(rng, circuit, pub_params)?;
             info!("Getting verifying key. (id: {})", &id);
             Ok(groth_params.vk)
         };
@@ -237,14 +239,12 @@ fn ensure_parent(path: &PathBuf) -> Result<()> {
     }
 }
 
-// Reads parameter mappings using mmap so that they can be lazily
-// loaded later.
 fn read_cached_params<E: JubjubEngine>(
     cache_entry_path: &PathBuf,
-) -> Result<groth16::MappedParameters<E>> {
+) -> Result<groth16::Parameters<E>> {
     info!("checking cache_path: {:?} for parameters", cache_entry_path);
-    with_exclusive_read_lock(cache_entry_path, |_| {
-        let params = Parameters::build_mapped_parameters(cache_entry_path.to_path_buf(), false)?;
+    with_exclusive_read_lock(cache_entry_path, |mut f| {
+        let params = Parameters::read(&mut f, false)?;
         info!("read parameters from cache {:?} ", cache_entry_path);
 
         Ok(params)

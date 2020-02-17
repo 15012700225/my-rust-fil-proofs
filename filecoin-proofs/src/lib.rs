@@ -12,12 +12,9 @@ pub mod serde_big_array;
 pub mod singletons;
 pub mod types;
 
-pub use self::api::*;
-pub use self::constants::SINGLE_PARTITION_PROOF_LEN;
-pub use self::param::{ParameterData, ParameterMap};
-pub use self::types::*;
-
-pub use storage_proofs;
+pub use api::*;
+pub use constants::SINGLE_PARTITION_PROOF_LEN;
+pub use types::*;
 
 #[cfg(test)]
 pub(crate) const TEST_SEED: [u8; 16] = [

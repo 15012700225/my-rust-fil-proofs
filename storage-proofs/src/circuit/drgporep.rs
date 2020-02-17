@@ -508,7 +508,6 @@ impl<'a, H: Hasher> Circuit<Bls12> for DrgPoRepCircuit<'a, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::circuit::metric::MetricCS;
     use crate::circuit::test::*;
     use crate::compound_proof;
     use crate::drgporep;
@@ -517,11 +516,9 @@ mod tests {
     use crate::hasher::{Blake2sHasher, Hasher, PedersenHasher};
     use crate::porep::PoRep;
     use crate::proof::{NoRequirements, ProofScheme};
-    use crate::stacked::CacheKey;
     use crate::util::data_at_node;
 
     use ff::Field;
-    use merkletree::store::StoreConfig;
     use rand::SeedableRng;
     use rand_xorshift::XorShiftRng;
 
@@ -529,7 +526,7 @@ mod tests {
     fn drgporep_input_circuit_with_bls12_381() {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
-        let nodes = 16;
+        let nodes = 12;
         let degree = BASE_DEGREE;
         let challenge = 2;
 
@@ -561,11 +558,13 @@ mod tests {
 
         // MT for original data is always named tree-d, and it will be
         // referenced later in the process as such.
+        use crate::stacked::CacheKey;
+        use merkletree::store::{StoreConfig, DEFAULT_CACHED_ABOVE_BASE_LAYER};
         let cache_dir = tempfile::tempdir().unwrap();
         let config = StoreConfig::new(
             cache_dir.path(),
             CacheKey::CommDTree.to_string(),
-            StoreConfig::default_cached_above_base_layer(nodes),
+            DEFAULT_CACHED_ABOVE_BASE_LAYER,
         );
 
         let pp = drgporep::DrgPoRep::<PedersenHasher, BucketGraph<_>>::setup(&sp)
@@ -573,7 +572,7 @@ mod tests {
         let (tau, aux) = drgporep::DrgPoRep::<PedersenHasher, _>::replicate(
             &pp,
             &replica_id.into(),
-            (&mut data[..]).into(),
+            data.as_mut_slice(),
             None,
             Some(config),
         )
@@ -634,7 +633,7 @@ mod tests {
         assert!(
             proof_nc.nodes[0]
                 .proof
-                .validate_data(data_node.unwrap().into()),
+                .validate_data(&fr_into_bytes::<Bls12>(&data_node.unwrap())),
             "failed to verify data commitment with data"
         );
 
@@ -742,7 +741,7 @@ mod tests {
 
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
 
-        let nodes = 8;
+        let nodes = 5;
         let degree = BASE_DEGREE;
         let challenges = vec![1, 3];
 
@@ -766,7 +765,6 @@ mod tests {
                 challenges_count: 2,
             },
             partitions: None,
-            priority: false,
         };
 
         let public_params =
@@ -774,17 +772,19 @@ mod tests {
 
         // MT for original data is always named tree-d, and it will be
         // referenced later in the process as such.
+        use crate::stacked::CacheKey;
+        use merkletree::store::{StoreConfig, DEFAULT_CACHED_ABOVE_BASE_LAYER};
         let cache_dir = tempfile::tempdir().unwrap();
         let config = StoreConfig::new(
             cache_dir.path(),
             CacheKey::CommDTree.to_string(),
-            StoreConfig::default_cached_above_base_layer(nodes),
+            DEFAULT_CACHED_ABOVE_BASE_LAYER,
         );
 
         let (tau, aux) = drgporep::DrgPoRep::<H, _>::replicate(
             &public_params.vanilla_params,
             &replica_id.into(),
-            (&mut data[..]).into(),
+            data.as_mut_slice(),
             None,
             Some(config),
         )
@@ -813,7 +813,6 @@ mod tests {
                 challenges_count: 2,
             },
             partitions: None,
-            priority: false,
         };
 
         let public_params =
@@ -839,12 +838,13 @@ mod tests {
                 &public_params.vanilla_params,
             );
 
-            let mut cs_blank = MetricCS::new();
+            let mut cs_blank = TestConstraintSystem::new();
             blank_circuit
                 .synthesize(&mut cs_blank)
                 .expect("failed to synthesize blank circuit");
 
             let a = cs_blank.pretty_print_list();
+
             let b = cs.pretty_print_list();
 
             for (i, (a, b)) in a.chunks(100).zip(b.chunks(100)).enumerate() {
@@ -853,8 +853,9 @@ mod tests {
         }
 
         {
-            let gparams = DrgPoRepCompound::<H, _>::groth_params(&public_params.vanilla_params)
-                .expect("failed to get groth params");
+            let gparams =
+                DrgPoRepCompound::<H, _>::groth_params(Some(rng), &public_params.vanilla_params)
+                    .expect("failed to get groth params");
 
             let proof = DrgPoRepCompound::<H, _>::prove(
                 &public_params,

@@ -1,12 +1,11 @@
 pub mod blake2s;
 pub mod pedersen;
-pub mod poseidon;
 pub mod sha256;
 
-pub mod types;
+mod types;
 
-pub use self::blake2s::*;
-pub use self::pedersen::*;
-pub use self::poseidon::*;
-pub use self::sha256::*;
-pub use self::types::*;
+pub use self::types::{Domain, HashFunction, Hasher};
+
+pub use self::blake2s::Blake2sHasher;
+pub use self::pedersen::PedersenHasher;
+pub use self::sha256::Sha256Hasher;
