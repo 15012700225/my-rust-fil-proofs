@@ -26,7 +26,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            maximize_caching: false,
+            maximize_caching: true,
             merkle_tree_path: "/tmp/merkle-trees".into(),
             num_proving_threads: 1,
             replicated_trees_dir: "".into(),
