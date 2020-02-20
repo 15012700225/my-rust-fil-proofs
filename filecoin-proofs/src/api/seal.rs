@@ -67,13 +67,13 @@ pub fn seal_pre_commit<R: AsRef<Path>, T: AsRef<Path>, S: AsRef<Path>>(
         .with_context(|| format!("could not read out_path={:?}", out_path.as_ref()))?;
 
     // Copy unsealed data to output location, where it will be sealed in place.
-    //fs::copy(&in_path, &out_path).with_context(|| {
-    //    format!(
-    //        "could not copy in_path={:?} to out_path={:?}",
-    //        in_path.as_ref(),
-    //        out_path.as_ref()
-    //    )
-    //})?;
+    fs::copy(&in_path, &out_path).with_context(|| {
+        format!(
+            "could not copy in_path={:?} to out_path={:?}",
+            in_path.as_ref(),
+            out_path.as_ref()
+        )
+    })?;
 
     let f_data = OpenOptions::new()
         .read(true)
