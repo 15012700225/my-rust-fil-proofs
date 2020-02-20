@@ -30,7 +30,7 @@ impl Default for Settings {
             merkle_tree_path: "/tmp/merkle-trees".into(),
             num_proving_threads: 2,
             replicated_trees_dir: "".into(),
-            pedersen_hash_exp_window_size: 16,
+            pedersen_hash_exp_window_size: 20,
         }
     }
 }
