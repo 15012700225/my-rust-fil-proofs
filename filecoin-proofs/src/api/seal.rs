@@ -77,7 +77,7 @@ pub fn seal_pre_commit<R: AsRef<Path>, T: AsRef<Path>, S: AsRef<Path>>(
 
     let f_data = OpenOptions::new()
         .read(true)
-        .write(true)
+        /*.write(true)*/
         .open(&out_path)
         .with_context(|| format!("could not open out_path={:?}", out_path.as_ref()))?;
 
